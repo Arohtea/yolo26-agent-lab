@@ -32,7 +32,7 @@ def fingerprint(shapes: list[dict]) -> str:
     return hashlib.sha256(json.dumps(sorted(shapes, key=lambda shape:shape.get("id", 0)), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def upload_cvat(settings: Settings, run_id: str, classes: list[dict], frame_paths: list[Path], boxes: list[dict]) -> tuple[int, str]:
+def upload_cvat(settings: Settings, run_id: str, classes: list[dict], frame_paths: list[Path], boxes: list[dict], *, progress=None) -> tuple[int, str]:
     """创建本地图片任务并按实际帧名关联自动标注。
 
     :param settings: CVAT 服务配置。
@@ -42,6 +42,8 @@ def upload_cvat(settings: Settings, run_id: str, classes: list[dict], frame_path
     :param boxes: 待人工审核的真实检测框。
     :returns: CVAT 任务 ID 与上传后标注摘要。
     """
+    if progress:
+        progress("connecting_cvat")
     with cvat_client(settings) as client:
         task_name = f"YOLO Agent 审核 {run_id}"
         matches = get_paginated_collection(client.api_client.tasks_api.list_endpoint, search=run_id)
@@ -51,11 +53,15 @@ def upload_cvat(settings: Settings, run_id: str, classes: list[dict], frame_path
         if existing:
             task = existing[0]
         else:
+            if progress:
+                progress("uploading_images")
             task = client.tasks.create_from_data(
                 spec={"name":task_name, "labels":[{"name":category["name"],"type":"rectangle","attributes":[{"name":name,"input_type":"text","mutable":False,"values":[],"default_value":""} for name in ("platform_id", "annotation_source", "model_version", "confidence", "flags")]} for category in classes]},
                 resource_type=ResourceType.LOCAL, resources=[str(path) for path in frame_paths],
                 data_params={"image_quality":100,"sorting_method":"lexicographical"},
             )
+        if progress:
+            progress("matching_frames")
         frame_lookup = {Path(frame.name).stem:index for index,frame in enumerate(task.get_frames_info())}
         if set(frame_lookup) != {path.stem for path in frame_paths}:
             raise DatasetError(409, "CVAT 实际帧与平台图片不一致，拒绝关联标注")
@@ -79,6 +85,8 @@ def upload_cvat(settings: Settings, run_id: str, classes: list[dict], frame_path
                 points=box["bbox"], source="auto", occluded=False, z_order=0,
                 attributes=[models.AttributeValRequest(spec_id=attributes[name], value=value) for name,value in values.items()],
             ))
+        if progress:
+            progress("uploading_annotations")
         task.set_annotations(models.LabeledDataRequest(shapes=shapes, tags=[], tracks=[]))
         current = task.get_annotations()
         return task.id, fingerprint([shape.to_dict() for shape in current.shapes])

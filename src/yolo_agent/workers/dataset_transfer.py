@@ -22,7 +22,7 @@ from yolo_agent.schemas.dataset import ImageRead
 from yolo_agent.services.annotations import annotation_digest
 from yolo_agent.services.dataset_transfer import ignored_file, upload_name
 from yolo_agent.services.datasets import DatasetService, owned_path
-from yolo_agent.services.inspector import FORMATS, analyze_images, inspect_image
+from yolo_agent.services.inspector import FORMATS, analyze_images, inspect_image, encoded_image_suffix
 from yolo_agent.workers.dataset_tasks import _write_json
 
 
@@ -116,9 +116,7 @@ def prepare_yolo_source(settings, task_id: str, parameters: dict) -> tuple[Path,
                 encoding = media.format
                 if media.width * media.height > settings.max_image_pixels:
                     raise ValueError(f"图片超过解码像素限制：{image.name}")
-            suffix = image.suffix.lower()
-            if FORMATS[suffix] != encoding and not (encoding == "MPO" and suffix in {".jpg", ".jpeg"}):
-                suffix = next(ext for ext, fmt in FORMATS.items() if fmt == encoding)
+            suffix = encoded_image_suffix(image, encoding)
             image_target = view / "images" / split / (stem + suffix)
             label_target = view / "labels" / split / (stem + ".txt")
             image_target.parent.mkdir(parents=True, exist_ok=True)
@@ -158,7 +156,7 @@ def import_labeled(engine, settings, task_id: str, dataset_id: str, parameters: 
     with Session(engine) as session, session.begin():
         task = session.get(DatasetTask, task_id)
         task.total = len(items)
-        existing_count = session.scalar(select(func.count()).select_from(DatasetImage).where(DatasetImage.dataset_id == dataset_id))
+        existing_count = session.scalar(select(func.count()).select_from(DatasetImage).where(DatasetImage.dataset_id == dataset_id, DatasetImage.deleted_at.is_(None)))
         if existing_count + len(items) > settings.max_dataset_images:
             raise ValueError("追加导入后数据集图片数超过上限")
         project_id = session.get(Dataset, dataset_id).project_id
@@ -182,7 +180,7 @@ def import_labeled(engine, settings, task_id: str, dataset_id: str, parameters: 
             original_name=source["name"], storage_path=str(path.relative_to(settings.storage_dir.resolve())),
             size_bytes=path.stat().st_size, preview_path=preview, created_at=utc_now(), **info)
         images.append(image)
-        snapshot = {**ImageRead.model_validate(image).model_dump(), "storage_path": image.storage_path, "split": split}
+        snapshot = {**ImageRead.model_validate(image).model_dump(), "storage_path": image.storage_path, "split": split, "group_id": "external:" + identity}
         members.append(snapshot)
         image_boxes, before = [], []
         for annotation in item.annotations:

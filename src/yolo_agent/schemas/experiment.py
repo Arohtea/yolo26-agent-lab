@@ -14,6 +14,7 @@ OPTIMIZERS = ("auto", "SGD", "MuSGD", "Adam", "AdamW", "Adamax", "NAdam", "RAdam
 BatchSize = Literal["auto"] | Annotated[int, Field(strict=True, ge=-1, le=256)] | Annotated[float, Field(strict=True, gt=0, lt=1)]
 LayerIndex = Annotated[int, Field(strict=True, ge=0, le=20)]
 FreezeLayers = LayerIndex | Annotated[list[LayerIndex], Field(max_length=21)]
+TileSize = Annotated[bool, Field(strict=True)] | Annotated[int, Field(strict=True, gt=0, le=16384)]
 
 
 class TrainingParameters(InputModel):
@@ -24,6 +25,7 @@ class TrainingParameters(InputModel):
     model: Literal["yolo26n.pt", "yolo26s.pt", "yolo26m.pt"] = "yolo26n.pt"
     epochs: int = Field(default=100, ge=1, le=1000)
     imgsz: int = Field(default=640, ge=64, le=2560, multiple_of=32)
+    tile: TileSize = Field(default=False, description="高分辨率切片：false 关闭，true 跟随 imgsz，正整数指定原图窗口边长（像素）；训练与独立验证同步使用，增加计算量")
     batch: BatchSize = Field(default="auto", description="auto / -1 自动批量，1–256 为张数，0–1 之间的小数为 CUDA 显存比例；CPU 自动模式使用有界批量")
     optimizer: Literal[OPTIMIZERS] = "auto"
     patience: int = Field(default=20, ge=0, le=200, description="单次训练内部的早停等待 epoch 数，不是 Agent 跨实验停滞轮数")
@@ -96,14 +98,14 @@ PARAMETER_GROUPS = {
     "颜色增强": ("hsv_h", "hsv_s", "hsv_v", "bgr"),
     "几何增强": ("degrees", "translate", "scale", "shear", "perspective", "fliplr", "flipud"),
     "混合增强": ("mosaic", "mixup", "cutmix", "close_mosaic"),
-    "训练策略": ("multi_scale", "rect", "freeze", "patience", "seed", "deterministic"),
+    "训练策略": ("tile", "multi_scale", "rect", "freeze", "patience", "seed", "deterministic"),
 }
 
 
 def training_parameter_catalog() -> list[dict]:
     """供 Alpine 表单使用的分组字段，校验边界直接来自 Pydantic JSON Schema。"""
     properties = TrainingParameters.model_json_schema()["properties"]
-    return [{"name": group, "fields": [{"name": name, **properties[name], "control": "layers" if name == "freeze" else "boolean" if properties[name].get("type") == "boolean" else "number"} for name in names]} for group, names in PARAMETER_GROUPS.items()]
+    return [{"name": group, "fields": [{"name": name, **properties[name], "control": "tile" if name == "tile" else "layers" if name == "freeze" else "boolean" if properties[name].get("type") == "boolean" else "number"} for name in names]} for group, names in PARAMETER_GROUPS.items()]
 
 
 class ExecutionLimits(InputModel):

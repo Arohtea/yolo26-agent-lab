@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from PIL import Image
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import FileResponse
@@ -14,6 +15,7 @@ from yolo_agent.models.experiment import Experiment
 from yolo_agent.schemas.evaluation import EvaluationCreate, EvaluationRead
 from yolo_agent.services.datasets import DatasetError, owned_path
 from yolo_agent.services.evaluation import EvaluationService
+from yolo_agent.services.training import validate_export
 from yolo_agent.settings import get_settings
 
 router = APIRouter(prefix="/api/v1", tags=["验证评估"])
@@ -144,15 +146,42 @@ def evaluation_image(task_id: str, image_id: str, service: EvaluationService=Dep
     task, _, _ = checked_report(task_id, service)
     with Session(service.engine) as session:
         export = session.get(DatasetExport, task.dataset_export_id)
+        if export is None:
+            raise DatasetError(409, "评估绑定的数据工件不存在")
         root = owned_path(service.settings, export.directory)
-    manifest = json.loads((root / "manifest.json").read_text())
-    relative = f"images/val/{image_id}.png"
-    if relative not in manifest["sha256"]:
+    manifest = validate_export(service.settings, export, verify_files=False)
+    # 格式来自已封存的实际 val 清单，兼容历史 JPEG 与新生成 PNG，不扫描原始数据集兜底。
+    index = root / "val.txt"
+    if not index.is_file() or "val.txt" not in manifest["sha256"]:
+        raise DatasetError(409, "验证图片清单缺失")
+    with index.open("rb") as stream:
+        if hashlib.file_digest(stream, "sha256").hexdigest() != manifest["sha256"]["val.txt"]:
+            raise DatasetError(409, "验证图片清单指纹变化")
+    matches = []
+    for line in index.read_text().splitlines():
+        if not line.strip():
+            continue
+        candidate = (root / line.strip()).resolve()
+        if not candidate.is_relative_to(root / "images" / "val"):
+            raise DatasetError(409, "封存验证图片路径越界")
+        if candidate.stem == image_id:
+            matches.append(candidate)
+    if not matches:
         raise DatasetError(404, "图片不在此验证集中")
-    path = root / relative
-    if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest()!=manifest["sha256"][relative]:
-        raise DatasetError(409, "验证图片指纹变化")
-    return FileResponse(path, media_type="image/png")
+    if len(matches) != 1:
+        raise DatasetError(409, "验证集中存在同编号图片，无法确定对应文件")
+    path = matches[0]
+    relative = path.relative_to(root).as_posix()
+    if relative not in manifest["sha256"] or not path.is_file():
+        raise DatasetError(409, "验证图片文件缺失或未登记")
+    with path.open("rb") as stream:
+        if hashlib.file_digest(stream, "sha256").hexdigest() != manifest["sha256"][relative]:
+            raise DatasetError(409, "验证图片指纹变化")
+    with Image.open(path) as image:
+        media_type = {"PNG": "image/png", "JPEG": "image/jpeg", "MPO": "image/jpeg", "WEBP": "image/webp"}.get(image.format)
+    if media_type is None:
+        raise DatasetError(409, "不支持的验证图片编码")
+    return FileResponse(path, media_type=media_type, headers={"Cache-Control": "no-cache"})
 
 
 @router.get("/evaluations/{task_id}/artifacts/{artifact:path}", response_class=FileResponse)

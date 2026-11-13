@@ -26,6 +26,14 @@ class DatasetCreate(ProjectCreate):
     project_id: str = Field(min_length=36, max_length=36)
 
 
+class DatasetCopy(InputModel):
+    """跨项目建立独立副本；指定版本时保留冻结划分和标注。"""
+
+    project_id: str = Field(min_length=36, max_length=36)
+    name: str = Field(min_length=1, max_length=200)
+    version_id: str | None = Field(default=None, min_length=36, max_length=36)
+
+
 class LabeledImportOptions(InputModel):
     """已标注不自动等于已审核；审核继承须由操作者明确声明。"""
 
@@ -38,6 +46,20 @@ class LabeledImportOptions(InputModel):
         if self.accepted_reviewed_source and (not self.reviewer or not self.confirmation):
             raise ValueError("继承外部审核需填写审核者及审核来源说明，并确认已经检查漏标")
         return self
+
+
+class UploadCreate(InputModel):
+    """先登记可取消的上传，再接收 multipart；不限制文件字节数。"""
+
+    kind: Literal["import", "labeled_import"] = "import"
+    total: int = Field(ge=1)
+
+
+class AssetDelete(InputModel):
+    """操作者核对名称后删除，Agent 工具不暴露此入口。"""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=False)
+    confirm_name: str = Field(min_length=1, max_length=1000)
 
 
 class ImageGroups(InputModel):
@@ -112,6 +134,7 @@ class TaskRead(ORMModel):
     created_at: str
     started_at: str | None
     finished_at: str | None
+    progress_detail: dict | None = None
 
 
 class ImageRead(ORMModel):

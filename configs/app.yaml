@@ -14,6 +14,6 @@ health_timeout: 3
 log_level: INFO
 dataset_job_timeout: 1800
 max_upload_files: 500
-max_image_pixels: 40000000
+max_image_pixels: 120000000
 max_dataset_images: 20000
 max_similarity_pairs: 100000

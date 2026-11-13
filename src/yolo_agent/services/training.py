@@ -101,6 +101,8 @@ class TrainingService:
                 raise DatasetError(409, "数据版本或审核工件未封存")
             validate_export(self.settings, export, verify_files=False)
             dataset = session.get(Dataset, version.dataset_id)
+            if dataset.deleted_at:
+                raise DatasetError(409, "所属数据集已从工作区删除，不能创建新实验")
             parent = session.get(Experiment, data.parent_experiment_id) if data.parent_experiment_id else None
             if data.parent_experiment_id and (parent is None or parent.project_id != dataset.project_id):
                 raise DatasetError(422, "父实验必须属于同一项目")
@@ -129,6 +131,9 @@ class TrainingService:
                 experiment = session.get(Experiment, experiment_id)
                 if experiment is None:
                     raise DatasetError(404, "实验不存在")
+                version = session.get(DatasetVersion, experiment.dataset_version_id)
+                if session.get(Dataset, version.dataset_id).deleted_at:
+                    raise DatasetError(409, "所属数据集已删除，不能重新启动训练")
                 if experiment.status in {"queued","running","canceling","completed"}:
                     raise DatasetError(409, "实验正在执行或已完成，不能重复启动")
                 parent_task = session.scalar(select(TrainingTask).where(TrainingTask.experiment_id == experiment_id).order_by(TrainingTask.created_at.desc()).limit(1))
@@ -153,6 +158,9 @@ class TrainingService:
                 if resume:
                     if parent_task is None or parent_task.status not in {"failed","stopped"} or (parent_task.id, parent_task.checkpoint_path, parent_task.checkpoint_sha256) != checkpoint_identity:
                         raise DatasetError(409, "校验期间恢复来源已变化，请重新请求恢复")
+                version = session.get(DatasetVersion, experiment.dataset_version_id)
+                if session.get(Dataset, version.dataset_id).deleted_at:
+                    raise DatasetError(409, "所属数据集已删除，不能重新启动训练")
                 model = self.settings.training_model_dir / experiment.parameters["model"]
                 if not resume and (not model.is_file() or not model.with_suffix(".provenance.json").is_file()):
                     raise DatasetError(503, "预训练模型未准备，请运行 scripts/prepare_training_models.py")

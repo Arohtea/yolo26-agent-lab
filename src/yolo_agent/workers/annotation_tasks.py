@@ -50,7 +50,7 @@ def _verify_image(settings, snapshot: dict) -> Path:
     return path
 
 
-def _prepare_frames(settings, run_id: str, members: list[dict]) -> list[Path]:
+def _prepare_frames(settings, run_id: str, members: list[dict], progress=None) -> list[Path]:
     paths = []
     for member in members:
         source = _verify_image(settings, member)
@@ -65,11 +65,15 @@ def _prepare_frames(settings, run_id: str, members: list[dict]) -> list[Path]:
                     with Image.open(target) as cached:
                         if cached.format == "PNG" and cached.mode == "RGB" and cached.getexif().get(274, 1) == 1 and cached.size == oriented.size and cached.tobytes() == oriented.tobytes():
                             paths.append(target)
+                            if progress:
+                                progress("preparing_images", len(paths))
                             continue
                 except (OSError, ValueError, SyntaxError):
                     pass  # 不复用损坏缓存，仍从已验证指纹的原图重新生成。
             oriented.save(target, format="PNG")
         paths.append(target)
+        if progress:
+            progress("preparing_images", len(paths))
     return paths
 
 
@@ -104,6 +108,14 @@ def run_annotation_task(task_id: str) -> dict:
                 run.status = "running"
                 session.add_all([ImageReview(run_id=run_id, image_id=member["id"]) for member in members])
         logger.info("开始标注任务", extra={"task_id":task_id,"operation":kind,"run_id":run_id})
+
+        def report_progress(stage, completed_images=0, **details):
+            with Session(engine) as session, session.begin():
+                current = session.get(DatasetTask, task_id)
+                current.processed = completed_images
+                current.result = {"progress": {"stage": stage, "completed_images": completed_images,
+                                  "total_images": len(members), "estimated": False, **details}}
+
         export_record = None
         if kind == "auto_annotate":
             import torch
@@ -133,10 +145,12 @@ def run_annotation_task(task_id: str) -> dict:
         elif kind == "cvat_push":
             from yolo_agent.services.cvat import upload_cvat
 
-            frames = _prepare_frames(settings, run_id, members)
+            report_progress("preparing_images", 0)
+            frames = _prepare_frames(settings, run_id, members, progress=report_progress)
             with Session(engine) as session:
                 boxes = [AnnotationRead.model_validate(box).model_dump() for box in session.scalars(select(Annotation).where(Annotation.run_id == run_id))]
-            remote_id, digest = upload_cvat(settings, run_id, classes, frames, boxes)
+            remote_id, digest = upload_cvat(settings, run_id, classes, frames, boxes,
+                                            progress=lambda stage: report_progress(stage, len(frames)))
             with Session(engine) as session, session.begin():
                 current = session.get(AnnotationRun, run_id)
                 current.cvat_task_id, current.cvat_fingerprint = remote_id, digest
@@ -144,7 +158,9 @@ def run_annotation_task(task_id: str) -> dict:
         elif kind == "cvat_pull":
             from yolo_agent.services.cvat import download_cvat
 
+            report_progress("reading_review")
             remote = download_cvat(settings, cvat_task_id, require_accepted=True)
+            report_progress("validating_review")
             by_id = {member["id"]:member for member in members}
             if set(remote["frames"]) != set(by_id) or len(remote["frames"]) != len(members):
                 raise DatasetError(409, "CVAT 帧集合已变化，不能导入审核结果")
@@ -200,7 +216,7 @@ def run_annotation_task(task_id: str) -> dict:
                 current.cvat_fingerprint, current.status = remote["fingerprint"], "reviewed"
                 result = {"run_id":run_id,"status":"reviewed",**assert_reviewed(session,current)}
         elif kind == "yolo_export":
-            result, export_record = _export_dataset(engine, settings, run_id, members, classes)
+            result, export_record = _export_dataset(engine, settings, run_id, members, classes, progress=report_progress)
         else:
             raise ValueError("标注任务类型未注册")
         relative = f"reports/{task_id}.json"
@@ -224,9 +240,14 @@ def run_annotation_task(task_id: str) -> dict:
         engine.dispose()
 
 
-def _export_dataset(engine, settings, run_id: str, members: list[dict], classes: list[dict]) -> tuple[dict, DatasetExport]:
+def _export_dataset(engine, settings, run_id: str, members: list[dict], classes: list[dict], *, progress=None) -> tuple[dict, DatasetExport]:
     import datumaro as dm
 
+    def report(stage, completed_images=0, **details):
+        if progress:
+            progress(stage, completed_images, **details)
+
+    report("export_verifying_review")
     with Session(engine) as session:
         run = session.get(AnnotationRun, run_id)
         summary = assert_reviewed(session, run)
@@ -241,25 +262,37 @@ def _export_dataset(engine, settings, run_id: str, members: list[dict], classes:
     export_id = new_id()
     relative = f"exports/{export_id}"
     target = owned_path(settings, relative)
-    frames = _prepare_frames(settings, run_id, members)
-    by_id = {path.stem:path for path in frames}
+    report("export_preparing_images")
+    # 复用普通数据导出的策略：正向原图直接交给 Datumaro，旋转图片才生成 PNG。
+    # 不重编码大型 JPEG/MPO，不再为封存重复解码和复制一整套无损审核缓存。
+    by_id = {}
+    for index, member in enumerate(members, start=1):
+        by_id[member["id"]] = (_verify_image(settings, member) if member.get("exif_orientation", 1) in {None, 1}
+                               else _prepare_frames(settings, run_id, [member])[0])
+        report("export_preparing_images", index)
     grouped = defaultdict(list)
     for box in boxes:
         x1,y1,x2,y2 = box.bbox
         grouped[box.image_id].append(dm.Bbox(x1,y1,x2-x1,y2-y1,label=box.class_id))
     dataset = dm.Dataset.from_iterable([dm.DatasetItem(id=member["id"], subset=member["split"], media=dm.Image.from_file(str(by_id[member["id"]])), annotations=grouped[member["id"]]) for member in members], categories=[category["name"] for category in classes])
+    report("export_writing_dataset", len(members), export_id=export_id)
     dataset.export(str(target), "yolo_ultralytics", save_media=True)
     file_hashes = {}
-    for path in sorted(target.rglob("*")):
-        if path.is_file():
-            with path.open("rb") as stream:
-                file_hashes[path.relative_to(target).as_posix()] = hashlib.file_digest(stream, "sha256").hexdigest()
+    files = sorted(path for path in target.rglob("*") if path.is_file())
+    report("export_hashing", len(members), completed_files=0, total_files=len(files), export_id=export_id)
+    for index, path in enumerate(files, start=1):
+        with path.open("rb") as stream:
+            file_hashes[path.relative_to(target).as_posix()] = hashlib.file_digest(stream, "sha256").hexdigest()
+        if index % 10 == 0 or index == len(files):
+            report("export_hashing", len(members), completed_files=index, total_files=len(files), export_id=export_id)
     summary.update(image_count=len(members), annotation_count=len(boxes), split_counts=dict(Counter(member["split"] for member in members)), ready_for_training=True)
     manifest = {"export_id":export_id,"version_id":version_id,"run_id":run_id,"classes":classes,"summary":summary,"sha256":file_hashes,"reviewed_at":utc_now()}
     manifest_path = target / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2)+"\n")
     manifest_hash = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    report("export_archiving", len(members), export_id=export_id)
     archive = Path(shutil.make_archive(str(target), "zip", root_dir=target))
+    report("export_verifying_archive", len(members), export_id=export_id)
     with archive.open("rb") as stream:
         archive_hash = hashlib.file_digest(stream, "sha256").hexdigest()
     record = DatasetExport(id=export_id, version_id=version_id, run_id=run_id, directory=relative, manifest_sha256=manifest_hash, archive_path=f"{relative}.zip", archive_sha256=archive_hash, summary=summary)

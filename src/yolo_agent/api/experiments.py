@@ -12,6 +12,7 @@ from yolo_agent.schemas.experiment import ExperimentCreate, ExperimentRead, Mode
 from yolo_agent.services.exports import ExportService
 from yolo_agent.services.datasets import DatasetError, owned_path
 from yolo_agent.services.training import TrainingService
+from yolo_agent.services.chart_artifacts import CHARTS
 from yolo_agent.settings import get_settings
 
 router = APIRouter(prefix="/api/v1", tags=["实验与训练"])
@@ -169,6 +170,31 @@ def experiment_metrics(experiment_id: str,task_id: str|None=None,limit: int=Quer
         statement=statement.where(ExperimentMetric.task_id==task_id)
     with Session(service.engine) as session:
         return [{"task_id":row.task_id,"epoch":row.epoch,"name":row.name,"value":row.value,"created_at":row.created_at} for row in session.scalars(statement)]
+
+
+@router.get("/experiments/{experiment_id}/charts")
+def training_charts(experiment_id: str, service: TrainingService = Depends(training_service)):
+    """仅列出最近一次训练尝试已经写出的官方图，不拿旧尝试冒充当前结果。"""
+    get_experiment(experiment_id, service)
+    with Session(service.engine) as session:
+        task = session.scalar(select(TrainingTask).where(TrainingTask.experiment_id == experiment_id).order_by(TrainingTask.created_at.desc()).limit(1))
+        if task is None:
+            return []
+        root = owned_path(service.settings, f"training/{task.id}/run")
+        return [{"name": name, "task_id": task.id, "url": f"/api/v1/training-tasks/{task.id}/charts/{name}"}
+                for name, filename in CHARTS.items() if (root / filename).is_file()]
+
+
+@router.get("/training-tasks/{task_id}/charts/{chart}", response_class=FileResponse)
+def training_chart(task_id: str, chart: str, service: TrainingService = Depends(training_service)):
+    """按固定图名展示真实训练结果图，可在新标签页查看原尺寸。"""
+    service.get_task(task_id)
+    if chart not in CHARTS:
+        raise DatasetError(404, "不支持的图表")
+    path = owned_path(service.settings, f"training/{task_id}/run/{CHARTS[chart]}")
+    if not path.is_file():
+        raise DatasetError(404, "该次训练尚未生成此图")
+    return FileResponse(path, headers={"Cache-Control": "no-cache"})
 
 
 @router.get("/models",response_model=list[ModelRead])

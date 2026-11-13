@@ -90,7 +90,7 @@ class AgentService:
             with Session(self.engine) as session:
                 schema = session.get(ClassSchema, data.class_schema_id)
                 dataset = session.get(Dataset, data.dataset_id)
-                if schema is None or dataset is None or schema.project_id != dataset.project_id:
+                if schema is None or dataset is None or dataset.deleted_at or schema.project_id != dataset.project_id:
                     raise DatasetError(422,"数据与类别体系必须存在且属于同一项目")
                 validate_source_plan(session, self.settings, dataset.project_id, schema.classes, data.annotation_sources, coco_model=data.annotation_coco_model)
         with Session(self.engine,expire_on_commit=False) as session, session.begin():
@@ -108,7 +108,7 @@ class AgentService:
                 schema_id = data.class_schema_id
             dataset = session.get(Dataset,version.dataset_id if version else data.dataset_id)
             schema = session.get(ClassSchema,schema_id) if schema_id else None
-            if dataset is None or schema is None or schema.project_id!=dataset.project_id:
+            if dataset is None or dataset.deleted_at or schema is None or schema.project_id!=dataset.project_id:
                 raise DatasetError(422,"数据与类别体系必须存在且属于同一项目")
             # 操作者明确填写的参数只约束首轮，之后由模型调整；未填写的项从一开始就由模型决定。
             fields = sorted(data.initial_parameters.model_fields_set)

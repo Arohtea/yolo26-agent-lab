@@ -107,6 +107,8 @@ class AnnotationService:
             if not version or not schema:
                 raise DatasetError(404, "版本或类别体系不存在")
             dataset = session.get(Dataset, version.dataset_id)
+            if dataset.deleted_at:
+                raise DatasetError(409, "数据集已从工作区删除，不能新建标注")
             if not version.sealed or schema.project_id != dataset.project_id:
                 raise DatasetError(422, "必须使用同项目的类别体系及已封存版本")
             has_test = bool(session.scalar(select(VersionImage.image_id).where(VersionImage.version_id == version.id, VersionImage.split == "test").limit(1)))
@@ -120,6 +122,8 @@ class AnnotationService:
                 if version is None or schema is None:
                     raise DatasetError(404, "版本或类别体系不存在")
                 dataset = session.get(Dataset, version.dataset_id)
+                if dataset.deleted_at:
+                    raise DatasetError(409, "数据集已从工作区删除，不能新建标注")
                 if not version.sealed or schema.project_id != dataset.project_id:
                     raise DatasetError(422, "必须使用同项目的类别体系及已封存版本")
                 total = session.scalar(select(func.count()).select_from(VersionImage).where(VersionImage.version_id == version.id))

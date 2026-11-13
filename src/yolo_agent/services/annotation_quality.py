@@ -44,10 +44,14 @@ def source_quality(session, run, boxes: list[Annotation]) -> dict:
     splits = dict(session.execute(select(VersionImage.image_id, VersionImage.split).where(VersionImage.version_id == run.version_id)).all())
     choices = {int(key): value for key, value in run.parameters.get("class_sources", {}).items()}
     for box in boxes:
-        if box.id in originals or box.review_status not in {"approved", "corrected"}:
+        if box.id in originals:
             continue
-        if box.annotation_source == "external_reviewed_yolo":
-            row(box.annotation_source, box.class_name)["retained"] += 1
+        if box.annotation_source in {"external_reviewed_yolo", "external_labeled_yolo"}:
+            counts = row(box.annotation_source, box.class_name)
+            counts["proposed"] += 1
+            counts[{"approved": "retained", "corrected": "corrected", "rejected": "deleted"}.get(box.review_status, "pending")] += 1
+            continue
+        if box.review_status not in {"approved", "corrected"}:
             continue
         source = choices.get(box.class_id, {}).get("source", "grounding_dino") if box.class_id in original_ids else "human_added_class"
         if source == "project_model" and splits.get(box.image_id) == "test":

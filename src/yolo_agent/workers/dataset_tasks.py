@@ -13,7 +13,7 @@ from yolo_agent.models.database import create_database_engine
 from yolo_agent.models.dataset import DatasetImage, DatasetTask, DatasetVersion, VersionImage, new_id, utc_now
 from yolo_agent.schemas.dataset import ImageRead
 from yolo_agent.services.datasets import fail_dataset_task, owned_path
-from yolo_agent.services.inspector import analyze_images, inspect_image, split_images
+from yolo_agent.services.inspector import analyze_images, inspect_image, split_images, encoded_image_suffix
 from yolo_agent.settings import get_settings
 from yolo_agent.utils.logging import configure_logging
 
@@ -88,26 +88,39 @@ def run_dataset_task(task_id: str) -> dict:
         if kind == "dataset_export":
             from yolo_agent.workers.dataset_transfer import export_dataset
             return export_dataset(engine, settings, task_id, parameters)
+        if kind == "dataset_copy":
+            from yolo_agent.workers.dataset_copy import copy_dataset
+            return copy_dataset(engine, settings, task_id, dataset_id, parameters)
         version_record = None
         version_members = []
 
-        if kind == "import":
+        if kind in {"import", "image_recheck"}:
+            adaptations = []
             with Session(engine) as session:
-                ids = list(session.scalars(select(DatasetImage.id).where(DatasetImage.import_task_id == task_id).order_by(DatasetImage.created_at, DatasetImage.id)))
+                ids = parameters["image_ids"] if kind == "image_recheck" else list(session.scalars(select(DatasetImage.id).where(DatasetImage.import_task_id == task_id).order_by(DatasetImage.created_at, DatasetImage.id)))
             for index, image_id in enumerate(ids, start=1):
                 with Session(engine) as session:
                     image = session.get(DatasetImage, image_id)
                     source = owned_path(settings, image.storage_path)
                 preview_relative = f"previews/{image_id}.jpg"
                 information = inspect_image(source, owned_path(settings, preview_relative), settings.max_image_pixels)
+                information.setdefault("error", None)
                 information["preview_path"] = preview_relative if information["status"] == "valid" else None
+                if information["status"] == "valid":
+                    suffix = encoded_image_suffix(source, information["format"])
+                    if suffix != source.suffix.lower():
+                        normalized = source.with_suffix(suffix)
+                        source.rename(normalized)
+                        information["storage_path"] = normalized.relative_to(settings.storage_dir.resolve()).as_posix()
+                        adaptations.append({"image_id": image_id, "original_name": image.original_name, "encoding": information["format"], "storage_extension": suffix})
                 with Session(engine) as session, session.begin():
                     session.execute(update(DatasetImage).where(DatasetImage.id == image_id).values(**information))
                     session.execute(update(DatasetTask).where(DatasetTask.id == task_id).values(processed=index))
             with Session(engine) as session:
                 images = _snapshots(session, ids)
             report, _ = analyze_images(images, 4, settings.max_similarity_pairs)
-            result = {"image_count": len(ids), "valid_images": report["valid_images"], "status_counts": report["status_counts"]}
+            report["format_adaptations"] = adaptations
+            result = {"image_count": len(ids), "valid_images": report["valid_images"], "status_counts": report["status_counts"], "corrected_extensions": len(adaptations)}
         elif kind in {"analysis", "version"}:
             with Session(engine) as session:
                 images = _snapshots(session, parameters["image_ids"])

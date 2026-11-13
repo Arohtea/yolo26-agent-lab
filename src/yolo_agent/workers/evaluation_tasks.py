@@ -129,7 +129,7 @@ def run_evaluation_task(task_id: str) -> dict:
                 category_mapping.update({category:class_id for class_id,category in enumerate(validator.class_map)})
 
             detector.add_callback("on_val_end", capture_categories)
-            metrics = detector.val(data=str(data_path), split="val", imgsz=training_parameters["imgsz"], batch=2 if device=="cpu" else 1, device=device, workers=0, conf=0.001, iou=0.7, max_det=300, save_json=True, plots=True, project=str(output), name="validation", exist_ok=True, verbose=True)
+            metrics = detector.val(data=str(data_path), split="val", imgsz=training_parameters["imgsz"], tile=training_parameters.get("tile", False), batch=2 if device=="cpu" else 1, device=device, workers=0, conf=0.001, iou=0.7, max_det=300, save_json=True, plots=True, project=str(output), name="validation", exist_ok=True, verbose=True)
             validation_dir = output / "validation"
             predictions_path = validation_dir / "predictions.json"
             predictions = json.loads(predictions_path.read_text()) if predictions_path.is_file() else []
@@ -170,7 +170,7 @@ def run_evaluation_task(task_id: str) -> dict:
                 for key in ("map50","map50_95","precision","recall"):
                     summary[key] = None
                 summary["metric_unavailable_reason"] = "验证集没有正目标真值，不能评估 AP 或召回"
-            report = _json_value({"evaluation_id":task_id,"experiment_id":experiment_id,"model_id":model_id,"model_sha256":model_sha,"dataset_export_id":export_id,"dataset_version_id":version_id,"collected_at":utc_now(),"split":"val","test_used":False,"runtime":runtime.model_dump(mode="json"),"parameters":parameters,"metric_protocol":{"backend":"Ultralytics DetectionValidator","ap_confidence_floor":0.001,"ap_iou_range":[0.5,0.95],"confusion_confidence":0.001,"confusion_iou":0.5,"note":"AP 的最佳 F1 操作点与错误清单的固定阈值不同，不能直接混同比较"},"summary":summary,"per_class":per_class,"curves":curves,"confusion_matrix":{"labels":[*classes.values(),"background"],"rows":"predicted","columns":"true","matrix":metrics.confusion_matrix.matrix},"limitations":["小样本验收不代表泛化能力","遮挡缺少真值元数据，未推断遮挡错误","测试集不参与评估或优化"]})
+            report = _json_value({"evaluation_id":task_id,"experiment_id":experiment_id,"model_id":model_id,"model_sha256":model_sha,"dataset_export_id":export_id,"dataset_version_id":version_id,"collected_at":utc_now(),"split":"val","test_used":False,"runtime":runtime.model_dump(mode="json"),"parameters":parameters,"metric_protocol":{"backend":"Ultralytics DetectionValidator","tile":training_parameters.get("tile",False),"imgsz":training_parameters["imgsz"],"ap_confidence_floor":0.001,"ap_iou_range":[0.5,0.95],"confusion_confidence":0.001,"confusion_iou":0.5,"note":"AP 的最佳 F1 操作点与错误清单的固定阈值不同，不能直接混同比较"},"summary":summary,"per_class":per_class,"curves":curves,"confusion_matrix":{"labels":[*classes.values(),"background"],"rows":"predicted","columns":"true","matrix":metrics.confusion_matrix.matrix},"limitations":["小样本验收不代表泛化能力","遮挡缺少真值元数据，未推断遮挡错误","测试集不参与评估或优化"]})
             report["prediction_categories"] = [{"coco_category_id":category,"class_id":class_id,"name":classes[class_id]} for category,class_id in category_mapping.items()]
             artifact_hashes = {}
             for file in output.rglob("*"):

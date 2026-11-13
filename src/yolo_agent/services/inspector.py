@@ -15,7 +15,7 @@ from sklearn.model_selection import GroupShuffleSplit
 FORMATS = {".jpg": "JPEG", ".jpeg": "JPEG", ".png": "PNG", ".webp": "WEBP"}
 
 
-def inspect_image(path: Path, preview: Path, max_pixels: int, *, allow_mpo_primary_frame: bool = False) -> dict:
+def inspect_image(path: Path, preview: Path, max_pixels: int, *, allow_mpo_primary_frame: bool = True) -> dict:
     """校验文件结构并完整解码，生成面向人工审核的定向预览。
 
     :param path: 平台已经接管的原始图片。
@@ -29,13 +29,14 @@ def inspect_image(path: Path, preview: Path, max_pixels: int, *, allow_mpo_prima
     result = {"sha256": digest, "status": "corrupt"}
     try:
         with warnings.catch_warnings():
-            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            # 航拍图可能超过 Pillow 默认警告阈值；仍先读取尺寸并执行平台明确像素上限。
+            warnings.simplefilter("ignore", Image.DecompressionBombWarning)
             with Image.open(path, formats=list(FORMATS.values())) as original:
                 if original.width * original.height > max_pixels:
                     raise ValueError(f"图片超过 {max_pixels} 像素上限")
                 mpo = allow_mpo_primary_frame and original.format == "MPO" and path.suffix.lower() in {".jpg", ".jpeg"}
-                if original.format != FORMATS[path.suffix.lower()] and not mpo:
-                    raise ValueError("真实图片编码与扩展名不一致")
+                if original.format not in set(FORMATS.values()) and not mpo:
+                    raise ValueError("不支持的真实图片编码")
                 result["format"] = original.format
                 original.verify()
             # verify 不解码像素，重新打开并 load 才能发现截断的压缩图像。
@@ -52,6 +53,14 @@ def inspect_image(path: Path, preview: Path, max_pixels: int, *, allow_mpo_prima
     except (OSError, ValueError, SyntaxError, Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"[:2000]
     return result
+
+
+def encoded_image_suffix(path: Path, encoding: str) -> str:
+    """以 Pillow 实际解码格式决定平台副本扩展名，JPEG/MPO 保留兼容后缀。"""
+    suffix = path.suffix.lower()
+    if FORMATS.get(suffix) == encoding or encoding == "MPO" and suffix in {".jpg", ".jpeg"}:
+        return suffix
+    return next(extension for extension, format_name in FORMATS.items() if format_name == encoding)
 
 
 def analyze_images(images: list[dict], threshold: int, max_pairs: int) -> tuple[dict, nx.Graph]:

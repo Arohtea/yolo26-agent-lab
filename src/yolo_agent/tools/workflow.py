@@ -35,16 +35,11 @@ from yolo_agent.services.datasets import DatasetError, DatasetService, owned_pat
 from yolo_agent.services.evaluation import EvaluationService
 from yolo_agent.services.exports import ExportService
 from yolo_agent.services.training import TrainingService, validate_export
+from yolo_agent.services.chart_artifacts import CHARTS
 from yolo_agent.workers.queue import RUNTIME_PREFIX, redis_connection
 
 ACTIVE = {"queued", "running", "canceling"}
 # 图名固定映射到训练库产物；训练目录只含 train/val，评估目录只含 val，测试集图像无从读取。
-CHARTS = {
-    "results": "results.png", "labels": "labels.jpg", "train_batch": "train_batch0.jpg",
-    "confusion_matrix": "confusion_matrix.png", "confusion_matrix_normalized": "confusion_matrix_normalized.png",
-    "pr_curve": "BoxPR_curve.png", "f1_curve": "BoxF1_curve.png", "precision_curve": "BoxP_curve.png",
-    "recall_curve": "BoxR_curve.png", "val_predictions": "val_batch0_pred.jpg", "val_labels": "val_batch0_labels.jpg",
-}
 # 归一化面积小于 (32/640)^2 视为小目标，与评估报告的像素口径不同，只用于数据画像。
 SMALL_AREA = (32 / 640) ** 2
 _EXPORT_STATS: dict[tuple[str, str], dict] = {}

@@ -7,7 +7,7 @@ __pycache__/
 storage/
 data/
 experiments/
-models/
+/models/
 dist/
 build/
 .code-review-graph/

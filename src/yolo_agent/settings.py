@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     dataset_job_timeout: int = Field(default=1800, ge=30)
     max_upload_files: int = Field(default=500, ge=1, le=1000)
-    max_image_pixels: int = Field(default=40_000_000, ge=1024)
+    max_image_pixels: int = Field(default=120_000_000, ge=1024)
     max_dataset_images: int = Field(default=20_000, ge=3)
     max_similarity_pairs: int = Field(default=100_000, ge=1)
     annotation_model_path: Path = Path("storage/pretrained/grounding-dino-tiny")

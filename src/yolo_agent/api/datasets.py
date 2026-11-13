@@ -1,9 +1,12 @@
 """项目和数据资产接口，耗时检查仅通过 RQ 提交。"""
 
 from typing import Literal
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
 from fastapi.responses import FileResponse
+from PIL import Image, ImageOps
+from tempfile import NamedTemporaryFile
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile as StarletteUploadFile
 from pydantic import TypeAdapter, ValidationError
@@ -14,8 +17,8 @@ from sqlalchemy.orm import Session
 from yolo_agent.models.dataset import Dataset, DatasetImage, DatasetTask, DatasetVersion, Project, VersionImage
 from yolo_agent.schemas.dataset import AnalysisCreate, DatasetCreate, DatasetRead, ImageGroups, ImageRead, ProjectCreate, ProjectRead, TaskRead, VersionCreate, VersionImageRead, VersionRead
 from yolo_agent.services.datasets import DatasetError, DatasetService, owned_path
-from yolo_agent.schemas.dataset import LabeledImportOptions
-from yolo_agent.services.dataset_transfer import submit_labeled_import, submit_dataset_export, download_dataset_export
+from yolo_agent.schemas.dataset import LabeledImportOptions, UploadCreate, AssetDelete, DatasetCopy
+from yolo_agent.services.dataset_transfer import submit_labeled_import, submit_dataset_export, download_dataset_export, submit_dataset_copy
 from yolo_agent.settings import get_settings
 
 router = APIRouter(prefix="/api/v1", tags=["数据集管理"])
@@ -86,7 +89,7 @@ def list_datasets(project_id: str | None = None, limit: int = Query(50, ge=1, le
     :param service: 当前进程业务服务。
     :returns: 数据集列表。
     """
-    statement = select(Dataset).order_by(Dataset.created_at, Dataset.id).limit(limit).offset(offset)
+    statement = select(Dataset).where(Dataset.deleted_at.is_(None)).order_by(Dataset.created_at, Dataset.id).limit(limit).offset(offset)
     if project_id:
         statement = statement.where(Dataset.project_id == project_id)
     with Session(service.engine) as session:
@@ -103,13 +106,31 @@ def get_dataset(dataset_id: str, service: DatasetService = Depends(dataset_servi
     """
     with Session(service.engine) as session:
         dataset = session.get(Dataset, dataset_id)
-        if dataset is None:
+        if dataset is None or dataset.deleted_at:
             raise DatasetError(404, "数据集不存在")
         return dataset
 
 
+@router.delete("/datasets/{dataset_id}")
+def delete_dataset(dataset_id: str, data: AssetDelete, service: DatasetService = Depends(dataset_service)):
+    """仅操作者确认后从工作区移除，保留冻结数据与训练审计。"""
+    return service.delete_asset("dataset", dataset_id, data.confirm_name)
+
+
+@router.post("/datasets/{dataset_id}/copies", response_model=TaskRead, status_code=202)
+def copy_dataset(dataset_id: str, data: DatasetCopy, service: DatasetService = Depends(dataset_service)):
+    """复制其他项目的数据；原图与封存版本分别支持，不共享可变记录。"""
+    return submit_dataset_copy(service, dataset_id, data)
+
+
+@router.delete("/images/{image_id}")
+def delete_image(image_id: str, data: AssetDelete, service: DatasetService = Depends(dataset_service)):
+    """移除已上传原图，不追溯改变已经封存的版本成员。"""
+    return service.delete_asset("image", image_id, data.confirm_name)
+
+
 @router.post("/datasets/{dataset_id}/imports", response_model=TaskRead, status_code=202)
-def import_images(dataset_id: str, files: list[UploadFile] = File(...), metadata: str = Form("{}"), service: DatasetService = Depends(dataset_service)) -> DatasetTask:
+def import_images(dataset_id: str, files: list[UploadFile] = File(...), metadata: str = Form("{}"), upload_id: str | None = Query(None), service: DatasetService = Depends(dataset_service)) -> DatasetTask:
     """批量接收图片与逐图采集分组，返回异步任务。
 
     :param dataset_id: 数据集 ID。
@@ -122,7 +143,7 @@ def import_images(dataset_id: str, files: list[UploadFile] = File(...), metadata
         if len(metadata) > 512 * 1024:
             raise DatasetError(413, "分组元数据超过大小限制")
         groups = TypeAdapter(dict[str, ImageGroups]).validate_json(metadata)
-        return service.import_images(dataset_id, files, groups)
+        return service.import_images(dataset_id, files, groups, upload_id=upload_id)
     except ValidationError as exc:
         problems = [f"{'.'.join(str(part) for part in issue['loc']) or 'metadata'}: {issue['msg']}" for issue in exc.errors(include_input=False, include_context=False)[:3]]
         raise DatasetError(422, "分组元数据无效：" + "；".join(problems)) from exc
@@ -136,7 +157,7 @@ def import_images(dataset_id: str, files: list[UploadFile] = File(...), metadata
         "type": "object", "required": ["files"], "properties": {
             "files": {"type": "array", "items": {"type": "string", "format": "binary"}},
             "options": {"type": "string", "default": "{}", "description": "JSON：accepted_reviewed_source、reviewer、confirmation"}}}}}}})
-async def import_labeled_dataset(dataset_id: str, request: Request, service: DatasetService = Depends(dataset_service)) -> DatasetTask:
+async def import_labeled_dataset(dataset_id: str, request: Request, upload_id: str | None = Query(None), service: DatasetService = Depends(dataset_service)) -> DatasetTask:
     """上传 YOLO 文件夹或单个 ZIP，保留原划分；默认待审核，返回异步任务。
 
     files 保留相对路径。options 是 LabeledImportOptions 的 JSON；明确继承外部审核时必须填写审核者及来源说明。
@@ -153,7 +174,19 @@ async def import_labeled_dataset(dataset_id: str, request: Request, service: Dat
             options = LabeledImportOptions.model_validate_json(raw)
         except ValidationError as error:
             raise DatasetError(422, "导入选项无效：" + "；".join(item["msg"] for item in error.errors(include_input=False, include_context=False))) from error
-        return await run_in_threadpool(submit_labeled_import, service, dataset_id, files, options)
+        return await run_in_threadpool(submit_labeled_import, service, dataset_id, files, options, upload_id)
+
+
+@router.post("/datasets/{dataset_id}/uploads", response_model=TaskRead, status_code=201)
+def begin_upload(dataset_id: str, data: UploadCreate, service: DatasetService = Depends(dataset_service)):
+    """先建立上传身份，使传输期间可以查询并取消，不调用计算 Worker。"""
+    return service.begin_upload(dataset_id, data)
+
+
+@router.post("/dataset-tasks/{task_id}/cancel-upload", response_model=TaskRead)
+def cancel_upload(task_id: str, service: DatasetService = Depends(dataset_service)):
+    """取消正在传输或等待接收的上传，不取消已经启动的后台导入。"""
+    return service.cancel_upload(task_id)
 
 
 @router.post("/dataset-versions/{version_id}/exports", response_model=TaskRead, status_code=202)
@@ -180,7 +213,7 @@ def list_images(dataset_id: str, status: Literal["pending", "valid", "corrupt", 
     :returns: 图片元数据列表。
     """
     get_dataset(dataset_id, service)
-    statement = select(DatasetImage).where(DatasetImage.dataset_id == dataset_id).order_by(DatasetImage.created_at, DatasetImage.id).limit(limit).offset(offset)
+    statement = select(DatasetImage).where(DatasetImage.dataset_id == dataset_id, DatasetImage.deleted_at.is_(None)).order_by(DatasetImage.created_at, DatasetImage.id).limit(limit).offset(offset)
     if status:
         statement = statement.where(DatasetImage.status == status)
     with Session(service.engine) as session:
@@ -207,6 +240,38 @@ def preview_image(image_id: str, service: DatasetService = Depends(dataset_servi
         return FileResponse(path, media_type="image/jpeg")
 
 
+@router.get("/images/{image_id}/view", response_class=FileResponse)
+def view_image(image_id: str, service: DatasetService = Depends(dataset_service)):
+    """按实际编码提供原尺寸、正向展示副本，MPO 使用主画面，不改原始图片。"""
+    with Session(service.engine) as session:
+        image = session.get(DatasetImage, image_id)
+        if image is None:
+            raise DatasetError(404, "图片不存在")
+        if image.status != "valid":
+            raise DatasetError(409, "图片尚未通过解码检查，请先完成图片检查")
+        source = owned_path(service.settings, image.storage_path)
+    if not source.is_file():
+        raise DatasetError(404, "原图文件缺失")
+    # 浏览器原生支持的正向静态编码直接展示，不损失细节，也不重复转换大图。
+    if image.format in {"JPEG", "PNG", "WEBP"} and image.exif_orientation in {None, 1}:
+        return FileResponse(source, media_type={"JPEG": "image/jpeg", "PNG": "image/png", "WEBP": "image/webp"}[image.format])
+    target = owned_path(service.settings, f"previews/{image_id}-full.jpg")
+    if not target.is_file():
+        temporary = None
+        try:
+            with Image.open(source) as original:
+                original.seek(0)
+                oriented = ImageOps.exif_transpose(original)
+                with NamedTemporaryFile(dir=target.parent, suffix=".jpg", delete=False) as stream:
+                    temporary = stream.name
+                    oriented.convert("RGB").save(stream, format="JPEG", quality=95)
+            Path(temporary).replace(target)
+        finally:
+            if temporary:
+                Path(temporary).unlink(missing_ok=True)
+    return FileResponse(target, media_type="image/jpeg")
+
+
 @router.post("/datasets/{dataset_id}/analyses", response_model=TaskRead, status_code=202)
 def analyze_dataset(dataset_id: str, data: AnalysisCreate, service: DatasetService = Depends(dataset_service)) -> DatasetTask:
     """异步分析指定时刻的数据集图片集合。
@@ -217,6 +282,12 @@ def analyze_dataset(dataset_id: str, data: AnalysisCreate, service: DatasetServi
     :returns: 可轮询的分析任务。
     """
     return service.schedule(dataset_id, "analysis", data)
+
+
+@router.post("/datasets/{dataset_id}/image-rechecks", response_model=TaskRead, status_code=202)
+def recheck_images(dataset_id: str, service: DatasetService = Depends(dataset_service)):
+    """对未封存的异常原图重新解码并按真实编码适配平台文件后缀。"""
+    return service.recheck_images(dataset_id)
 
 
 @router.get("/dataset-tasks/{task_id}", response_model=TaskRead)
@@ -316,7 +387,7 @@ def project_versions(project_id: str|None=None,limit: int=Query(50,ge=1,le=200),
     :param service: 数据服务。
     :returns: 已封存版本列表。
     """
-    statement=select(DatasetVersion).order_by(DatasetVersion.created_at.desc()).limit(limit).offset(offset)
+    statement=select(DatasetVersion).where(DatasetVersion.dataset_id.in_(select(Dataset.id).where(Dataset.deleted_at.is_(None)))).order_by(DatasetVersion.created_at.desc()).limit(limit).offset(offset)
     if project_id:
         statement=statement.join(Dataset).where(Dataset.project_id==project_id)
     with Session(service.engine) as session:
@@ -346,8 +417,10 @@ def list_version_images(version_id: str, split: Literal["train", "val", "test"] 
     :returns: 版本创建时的成员快照，不随数据集后续导入变化。
     """
     get_version(version_id, service)
-    statement = select(VersionImage.snapshot).where(VersionImage.version_id == version_id).order_by(VersionImage.image_id).limit(limit).offset(offset)
+    statement = select(VersionImage).where(VersionImage.version_id == version_id).order_by(VersionImage.image_id).limit(limit).offset(offset)
     if split:
         statement = statement.where(VersionImage.split == split)
     with Session(service.engine) as session:
-        return list(session.scalars(statement))
+        # 早期已标注导入的 snapshot 未重复保存 group_id，使用同一冻结成员关系补齐响应。
+        # 不更新已封存清单或指纹，也不读取会变化的原图元数据。
+        return [{**row.snapshot, "split": row.split, "group_id": row.group_id} for row in session.scalars(statement)]

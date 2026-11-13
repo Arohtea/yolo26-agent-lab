@@ -4,6 +4,7 @@
   const ACTIVE = ["queued", "running", "waiting", "canceling"];
   const labels = {
     created: "已创建",
+    uploading: "上传中",
     queued: "排队中",
     running: "执行中",
     waiting: "等待计算",
@@ -186,10 +187,13 @@
    */
   function lab() {
     const charts = new Map();
+    const uploadRequests = new Map();
+    let uploadSequence = 0;
     let labeledFiles = [];
     const detailTickets = {
       dataset: 0,
       annotation: 0,
+      cvat: 0,
       experiment: 0,
       evaluation: 0,
       agent: 0,
@@ -248,9 +252,14 @@
       images: [],
       datasetTasks: [],
       datasetVersions: [],
+      copySources: [],
+      copyVersions: [],
+      copyVersionsLoading: false,
+      copySourceTicket: 0,
       imageOffset: 0,
       imagesMore: false,
       uploadCount: 0,
+      uploads: [],
       uploadMeta: "{}",
       uploadMode: "images",
       labeledUpload: { name: "", count: 0, bytes: 0, reviewed: false, reviewer: "", confirmation: "", progress: null },
@@ -270,6 +279,11 @@
       annotationTasks: [],
       annotationImages: [],
       annotationImage: null,
+      cvatSessionUrl: "",
+      cvatSessionKey: "",
+      cvatAttemptKey: "",
+      cvatConnecting: false,
+      cvatError: "",
       experimentId: "",
       experimentPinned: false,
       experiment: null,
@@ -278,6 +292,7 @@
       epochs: [],
       trainingLogs: "",
       trainingTaskId: "",
+      trainingCharts: [],
       compareIds: [],
       comparison: null,
       evaluations: [],
@@ -290,13 +305,14 @@
       modelExports: [],
       publications: [],
       publishPreview: null,
+      viewer: null,
       agentId: "",
       agent: null,
       agentEvents: [],
       agentIterations: [],
       agentBudget: null,
       eventCursor: 0,
-      trainForm: { params: emptyParams(), budget: {}, exportId: "", requirement: "", name: "" },
+      trainForm: { params: emptyParams(), budget: {}, exportId: "", requirement: "", name: "", lockModel: false },
       trainFormKey: "",
       trainNew: false,
       steps: [
@@ -322,11 +338,18 @@
         this.projectId = initial.projectId;
         history.replaceState(null, "", this.routeHref(this.page, this.projectId));
         window.addEventListener("hashchange", () => this.applyRoute(location.hash.slice(1)));
+        window.addEventListener("beforeunload", event => {
+          if (this.uploads.some(item => ["preparing", "uploading", "receiving", "canceling"].includes(item.phase))) {
+            event.preventDefault();
+            event.returnValue = "";
+          }
+        });
         document.addEventListener("visibilitychange", () => {
           if (!document.hidden) this.refresh();
         });
         await this.refresh(true);
         const tick = async () => {
+          if (!document.hidden) await this.pollUploads();
           if (!document.hidden && !this.busy) await this.refresh();
           poll = setTimeout(tick, 5000);
         };
@@ -376,6 +399,11 @@
         }
         const next = this.route(hash) || { page: "projects", projectId: "" };
         ++generation;
+        if (next.page !== this.page) {
+          ++detailTickets.cvat;
+          this.cvatSessionUrl = this.cvatSessionKey = this.cvatAttemptKey = this.cvatError = "";
+          this.cvatConnecting = false;
+        }
         if (next.projectId !== this.projectId) this.clearProjectState();
         this.projectId = next.projectId;
         this.page = next.page;
@@ -423,6 +451,8 @@
        * @returns {void} 清空项目范围的缓存和选择。
        */
       clearProjectState() {
+        this.cvatSessionUrl = this.cvatSessionKey = this.cvatAttemptKey = this.cvatError = "";
+        this.cvatConnecting = false;
         labeledFiles = [];
         this.labeledUpload = { name: "", count: 0, bytes: 0, reviewed: false, reviewer: "", confirmation: "", progress: null };
         ++generation;
@@ -453,6 +483,9 @@
         this.datasetTasks = [];
         this.datasetVersions = [];
         this.trainingTasks = [];
+        this.trainingCharts = [];
+        this.uploadCount = 0;
+        if (this.$refs.uploadFiles) this.$refs.uploadFiles.value = "";
         this.trainingLogs = "";
         this.trainingTaskId = "";
         this.metrics = [];
@@ -688,6 +721,32 @@
         this.annotationTasks = tasks;
         const index = this.annotations.findIndex((x) => x.id === id);
         if (index >= 0) this.annotations[index] = run;
+        if (this.page === "review" && run.cvat_task_id) await this.connectCvat();
+      },
+      /** 同源请求建立 Cookie 会话后再加载嵌入编辑器；轮询不重复登录或刷新正在编辑的作业。 */
+      async connectCvat(force = false) {
+        const run = this.currentAnnotation;
+        if (!run?.cvat_task_id) return;
+        const key = `${run.id}:${run.cvat_task_id}`;
+        if (!force && this.cvatAttemptKey === key) return;
+        const ticket = ++detailTickets.cvat;
+        this.cvatAttemptKey = key;
+        this.cvatConnecting = true;
+        this.cvatError = "";
+        this.cvatSessionUrl = this.cvatSessionKey = "";
+        try {
+          const result = await api(`/annotation-runs/${run.id}/cvat-session`, { method: "POST" });
+          if (ticket !== detailTickets.cvat || this.annotationId !== run.id || this.page !== "review") return;
+          const target = new URL(result.url);
+          if (!['http:', 'https:'].includes(target.protocol) || target.hostname !== location.hostname || target.username || target.password)
+            throw new Error("审核服务地址与当前工作台不匹配");
+          this.cvatSessionKey = key;
+          this.cvatSessionUrl = target.href;
+        } catch (error) {
+          if (ticket === detailTickets.cvat) this.cvatError = error.message;
+        } finally {
+          if (ticket === detailTickets.cvat) this.cvatConnecting = false;
+        }
       },
       /** 标注编辑留在 CVAT，此处只预览候选及来源。
        * @param {string} imageId 批次中的图片身份。
@@ -701,10 +760,36 @@
           );
           if (runId !== this.annotationId) return;
           this.annotationImage = preview;
-          this.show("annotationImage");
+          this.openImage(`/api/v1/images/${preview.image.id}/view`, preview.image.original_name,
+            preview.boxes.filter(box => box.review_status !== "rejected").map(box => ({
+              bbox: [box.bbox[0] / preview.image.width, box.bbox[1] / preview.image.height, (box.bbox[2] - box.bbox[0]) / preview.image.width, (box.bbox[3] - box.bbox[1]) / preview.image.height],
+              label: `${box.class_name} · ${box.confidence == null ? this.status(box.review_status) : this.metric(box.confidence, 2)}`, status: "tp",
+            })), preview.boxes);
         } catch (error) {
           this.error = error.message;
         }
+      },
+      openImage(src, title, boxes = [], details = null) {
+        this.viewer = { src, title, boxes, details, zoom: 1, fitWidth: 800, naturalWidth: 0, showBoxes: true, loading: true, error: "" };
+        this.$nextTick(() => { if (!this.$refs.imageViewer.open) this.$refs.imageViewer.showModal(); });
+      },
+      imageLoaded(event) {
+        if (!this.viewer) return;
+        const image = event.target, viewport = this.$refs.viewerViewport;
+        this.viewer.naturalWidth = image.naturalWidth;
+        this.viewer.fitWidth = Math.min(image.naturalWidth, Math.max(240, viewport.clientWidth - 48), Math.max(200, viewport.clientHeight - 48) * image.naturalWidth / image.naturalHeight);
+        this.viewer.loading = false;
+      },
+      closeImage() { this.$refs.imageViewer.close(); this.viewer = null; },
+      zoomImage(factor) { if (this.viewer) this.viewer.zoom = Math.max(0.25, Math.min(16, this.viewer.zoom * factor)); },
+      openErrorImage(item) {
+        const classes = this.evaluationReport?.per_class || [];
+        const boxes = [...item.ground_truth.map(box => ({ ...box, truth: true })), ...item.predictions].map(box => ({ ...box, label: `${box.truth ? "真值" : "预测"} · ${box.label || classes.find(row => row.class_id === box.class_id)?.name || "目标"} · ${box.status.toUpperCase()}` }));
+        const { imageStatus, ...details } = item;
+        this.openImage(`/api/v1/evaluations/${this.evaluationId}/images/${item.image_id}`, `错误定位 · TP ${item.counts.tp} / FP ${item.counts.fp} / FN ${item.counts.fn}`, boxes, details);
+      },
+      viewerBoxStyle(box) {
+        return { left: `${box.bbox[0] * 100}%`, top: `${box.bbox[1] * 100}%`, width: `${box.bbox[2] * 100}%`, height: `${box.bbox[3] * 100}%` };
       },
       /** 只进入当前项目关联的审核批次，编辑由嵌入的官方 CVAT 完成。 */
       async openCvatReview(runId = this.annotationId) {
@@ -729,16 +814,18 @@
           this.trainingLogs = "";
           this.metrics = [];
           this.epochs = [];
+          this.trainingCharts = [];
           this.evaluationId = "";
           this.evaluationReport = null;
           this.errorImages = [];
           this.evaluations = [];
         }
         this.experimentId = id;
-        const [experiment, tasks, evaluations] = await Promise.all([
+        const [experiment, tasks, evaluations, chartArtifacts] = await Promise.all([
           api(`/experiments/${id}`),
           api(`/experiments/${id}/tasks`),
           api(`/evaluations?experiment_id=${id}&limit=50`),
+          api(`/experiments/${id}/charts`),
         ]);
         let rows = [],
           offset = 0;
@@ -758,6 +845,7 @@
           return;
         this.experiment = experiment;
         this.trainingTasks = tasks;
+        this.trainingCharts = chartArtifacts;
         this.metrics = rows;
         this.epochs = epochRows(rows);
         this.evaluations = evaluations;
@@ -811,7 +899,8 @@
           return;
         this.evaluationReport = report;
         this.loadedEvaluationId = id;
-        this.errorImages = errors.items;
+        const imageStates = new Map(this.errorImages.map(item => [item.image_id, item.imageStatus]));
+        this.errorImages = errors.items.map(item => ({ ...item, imageStatus: imageStates.get(item.image_id) || "loading" }));
         this.errorTotal = errors.total;
         if (this.page === "experiments")
           await this.$nextTick(() => this.plotPR());
@@ -936,7 +1025,7 @@
         return (this.annotationSources?.project_models || []).filter(model => model.covered_classes.includes(row.name.trim()));
       },
       annotationSourceName(source) {
-        return { yolo26_coco: "COCO 预训练", project_model: "项目模型", grounding_dino: "DINO", human_added_class: "人工新增类别", external_reviewed_yolo: "已审标签导入" }[source] || source;
+        return { yolo26_coco: "COCO 预训练", project_model: "项目模型", grounding_dino: "DINO", human_added_class: "人工新增类别", external_reviewed_yolo: "已审标签导入", external_labeled_yolo: "上传已有标签" }[source] || source;
       },
       annotationSelections(rows) {
         const result = {}, coco = new Set();
@@ -965,8 +1054,7 @@
       async uploadImages() {
         const input = this.$refs.uploadFiles;
         const files = Array.from(input?.files || []);
-        if (!files.length || this.busy) return;
-        this.busy = true;
+        if (!files.length || this.busy || this.datasetUploading) return;
         this.inlineError = "";
         try {
           try {
@@ -977,19 +1065,12 @@
           const body = new FormData();
           for (const file of files) body.append("files", file);
           body.append("metadata", this.uploadMeta || "{}");
-          await api(`/datasets/${this.datasetId}/imports`, {
-            method: "POST",
-            body,
-          });
+          const transfer = this.beginTransfer("import", files, body);
           input.value = "";
           this.uploadCount = 0;
-          this.toast("图片已提交，后台正在检查损坏与重复");
-          this.busy = false;
-          await this.refresh();
+          await transfer;
         } catch (error) {
           this.inlineError = error.message;
-        } finally {
-          this.busy = false;
         }
       },
       selectLabeledFiles(fileList) {
@@ -1005,44 +1086,121 @@
         this.inlineError = '';
       },
       async uploadLabeledDataset() {
-        if (this.busy || !this.datasetId || !labeledFiles.length) return;
+        if (this.busy || this.datasetUploading || !this.datasetId || !labeledFiles.length) return;
         const options = this.labeledUpload;
         this.inlineError = '';
         if (options.reviewed && (!options.reviewer.trim() || !options.confirmation.trim())) {
           this.inlineError = '请填写外部审核者和审核来源说明，或选择待审核导入';
           return;
         }
-        this.busy = true;
-        options.progress = 0;
         try {
           const body = new FormData();
           body.append('options', JSON.stringify({ accepted_reviewed_source: options.reviewed, reviewer: options.reviewer, confirmation: options.confirmation }));
           for (const file of labeledFiles) body.append('files', file, file.webkitRelativePath || file.name);
-          await new Promise((resolve, reject) => {
+          const transfer = this.beginTransfer("labeled_import", labeledFiles, body);
+          labeledFiles = [];
+          options.name = ''; options.count = 0; options.bytes = 0;
+          for (const ref of ['labeledFolder', 'labeledArchive']) if (this.$refs[ref]) this.$refs[ref].value = '';
+          await transfer;
+        } catch (error) {
+          this.inlineError = error.message;
+        }
+      },
+      /** 上传属于应用级任务；路由切换不会释放 XHR，也不会改动已捕获的数据集归属。 */
+      async beginTransfer(kind, files, body) {
+        // 仅用于本页列表身份；业务 UUID 由服务端生成，普通 HTTP 站点也可上传。
+        const key = `upload-${Date.now()}-${++uploadSequence}`;
+        this.uploads.push({ key, id: "", kind, datasetId: this.datasetId, projectId: this.projectId,
+          datasetName: this.datasets.find(row => row.id === this.datasetId)?.name || "数据集",
+          projectName: this.currentProject?.name || "项目", count: files.length, phase: "preparing",
+          loaded: 0, total: files.reduce((sum, file) => sum + file.size, 0), percent: 0, processed: 0, error: "" });
+        const transfer = this.uploads.find(item => item.key === key);
+        try {
+          const task = await api(`/datasets/${transfer.datasetId}/uploads`, { method: "POST", body: { kind, total: files.length } });
+          transfer.id = task.id;
+          transfer.phase = "uploading";
+          const result = await new Promise((resolve, reject) => {
             const xhr = new XMLHttpRequest();
-            xhr.open('POST', `${API}/datasets/${this.datasetId}/labeled-imports`);
-            xhr.upload.onprogress = event => { if (event.lengthComputable) options.progress = Math.round(event.loaded / event.total * 100); };
+            uploadRequests.set(key, xhr);
+            xhr.open("POST", `${API}/datasets/${transfer.datasetId}/${kind === "import" ? "imports" : "labeled-imports"}?upload_id=${encodeURIComponent(task.id)}`);
+            xhr.upload.onprogress = event => {
+              if (transfer.phase === "canceling") return;
+              transfer.loaded = event.loaded;
+              if (event.lengthComputable) { transfer.total = event.total; transfer.percent = Math.round(event.loaded / event.total * 100); }
+            };
+            xhr.upload.onload = () => { if (transfer.phase !== "canceling") { transfer.percent = 100; transfer.phase = "receiving"; } };
             xhr.onload = () => {
               let result;
               try { result = JSON.parse(xhr.responseText); } catch (_) { result = null; }
               if (xhr.status >= 200 && xhr.status < 300) resolve(result);
-              else reject(new Error(result?.detail || `上传失败（HTTP ${xhr.status}）`));
+              else reject(new Error(typeof result?.detail === "string" ? result.detail : `上传失败（HTTP ${xhr.status}）`));
             };
-            xhr.onerror = () => reject(new Error('上传连接中断，请刷新后台任务确认是否已接收，再重新选择文件'));
+            xhr.onabort = () => reject(new DOMException("上传已取消", "AbortError"));
+            xhr.onerror = () => reject(new Error("上传连接中断，请查看后台任务确认接收状态"));
             xhr.send(body);
           });
-          labeledFiles = [];
-          options.name = ''; options.count = 0; options.bytes = 0;
-          for (const ref of ['labeledFolder', 'labeledArchive']) if (this.$refs[ref]) this.$refs[ref].value = '';
-          this.toast('数据包已接收，后台正在校验标签并创建版本');
-          this.busy = false;
-          await this.refresh();
+          transfer.phase = result.status;
+          transfer.processed = result.processed;
+          transfer.taskTotal = result.total;
+          transfer.percent = 100;
+          this.toast(`${transfer.datasetName}：文件已接收，可继续浏览其他页面`);
         } catch (error) {
-          this.inlineError = error.message;
+          if (transfer.phase !== "stopped") {
+            transfer.error = error.message;
+            // 响应丢失也可能已入队，先按持久状态核对，不能虚报取消成功。
+            if (transfer.id) {
+              try {
+                const task = await api(`/dataset-tasks/${transfer.id}`);
+                if (task.status === "uploading") await api(`/dataset-tasks/${transfer.id}/cancel-upload`, { method: "POST" });
+                transfer.phase = task.status === "uploading" ? "failed" : task.status;
+              } catch (_) { transfer.phase = "unknown"; }
+            } else transfer.phase = "failed";
+          }
         } finally {
-          options.progress = null;
-          this.busy = false;
+          uploadRequests.delete(key);
+          await this.refresh();
         }
+      },
+      async cancelTransfer(transfer) {
+        const previous = transfer.phase;
+        transfer.phase = "canceling";
+        try {
+          await api(`/dataset-tasks/${transfer.id}/cancel-upload`, { method: "POST" });
+          transfer.phase = "stopped";
+          transfer.error = "";
+          uploadRequests.get(transfer.key)?.abort();
+        } catch (error) {
+          transfer.phase = previous;
+          transfer.error = error.message;
+          try {
+            const task = await api(`/dataset-tasks/${transfer.id}`);
+            if (task.status !== "uploading") { transfer.phase = task.status; transfer.processed = task.processed; transfer.taskTotal = task.total; }
+          } catch (_) { /* 保留取消失败提示，传输仍由原 XHR 管理。 */ }
+        }
+      },
+      async cancelDatasetUpload(id) {
+        const transfer = this.uploads.find(item => item.id === id);
+        if (transfer) return this.cancelTransfer(transfer);
+        try {
+          await api(`/dataset-tasks/${id}/cancel-upload`, { method: "POST" });
+          this.toast("已取消未完成的上传，可重新选择文件");
+          await this.refresh();
+        } catch (error) { this.inlineError = error.message; }
+      },
+      async pollUploads() {
+        await Promise.all(this.uploads.filter(item => item.id && ["queued", "running", "unknown"].includes(item.phase)).map(async item => {
+          try {
+            const task = await api(`/dataset-tasks/${item.id}`);
+            item.phase = task.status; item.processed = task.processed; item.taskTotal = task.total;
+            item.error = task.error || "";
+          } catch (error) { item.error = error.message; }
+        }));
+      },
+      transferText(item) {
+        return ({ preparing: "正在登记上传", uploading: `正在传输 · ${item.percent}%`, receiving: "传输 100% · 服务器正在接收", canceling: "正在取消上传", queued: "文件已接收 · 等待后台检查", running: `后台检查 · ${item.processed} / ${item.taskTotal ?? item.count}`, completed: "导入完成", stopped: "上传已取消", failed: "上传失败", unknown: "接收状态待确认" })[item.phase] || this.status(item.phase);
+      },
+      get datasetUploading() {
+        return this.uploads.some(item => item.datasetId === this.datasetId && ["preparing", "uploading", "receiving", "canceling", "queued", "running", "unknown"].includes(item.phase)) || this.datasetTasks.some(item => item.dataset_id === this.datasetId && ["uploading", "queued", "running"].includes(item.status));
       },
       datasetAnnotation(versionId) {
         return this.annotations.filter(run => run.version_id === versionId && ['pending_review','reviewed','exported'].includes(run.status))
@@ -1129,7 +1287,9 @@
           exportId: this.exports[0]?.id || "",
           requirement: this.agent?.requirement || "",
           name: "",
+          lockModel: policy.allowed_models?.length === 1,
         };
+        if (this.trainForm.lockModel) this.trainForm.params.model = policy.allowed_models[0];
         this.trainFormKey = key;
       },
       syncTrainingForm() {
@@ -1157,12 +1317,14 @@
           if (value == null) continue;
           params[field] = typeof value === "boolean" ? String(value) : Array.isArray(value) ? JSON.stringify(value) : value;
         }
+        if (params.tile === "" && parameters.tile == null) params.tile = "false";
         this.trainForm = {
           params,
           budget: { ...this.agent.policy },
           exportId: iteration?.plan?.dataset_export_id || this.agent.dataset_export_id || "",
           requirement: this.agent.requirement || "",
           name: this.agent.name,
+          lockModel: this.agent.policy.allowed_models?.length === 1,
         };
         this.trainFormKey = key;
       },
@@ -1208,7 +1370,10 @@
             stagnation_rounds: Number(budget.stagnation_rounds),
             minimum_improvement: Number(budget.minimum_improvement),
             purpose: budget.purpose,
+            allowed_models: this.trainForm.lockModel ? [params.model] : (this.setupMode ? this.agent.policy.allowed_models : this.overview?.configuration?.agent_defaults?.allowed_models || ["yolo26n.pt", "yolo26s.pt"]),
           };
+          if (this.trainForm.lockModel && !params.model) throw new Error("锁定模型前，请先选择一个基座模型");
+          if (params.model && !policy.allowed_models.includes(params.model)) throw new Error("所选模型不在本次允许范围内，请锁定该模型或选择允许的模型");
           if (params.epochs > policy.max_epochs_per_experiment)
             throw new Error("首轮 epochs 超过单实验上限");
           if (params.imgsz > policy.max_imgsz)
@@ -1304,9 +1469,91 @@
         };
         this.$nextTick(() => this.$refs.dialog.showModal());
       },
+      async openDatasetCopy() {
+        if (this.busy) return;
+        const project = this.projectId;
+        this.busy = true;
+        this.inlineError = "";
+        try {
+          const rows = [];
+          for (let offset = 0; ; offset += 200) {
+            const page = await api(`/datasets?limit=200&offset=${offset}`);
+            rows.push(...page);
+            if (page.length < 200) break;
+          }
+          if (project !== this.projectId) return;
+          this.copySources = rows.filter(row => row.project_id !== project);
+          ++this.copySourceTicket;
+          this.copyVersions = [];
+          this.copyVersionsLoading = false;
+          await this.show("copyDataset");
+          this.form = { source_id: "", version_id: "", name: "" };
+        } catch (error) { this.inlineError = error.message; }
+        finally { this.busy = false; }
+      },
+      async chooseCopySource() {
+        const id = this.form.source_id;
+        const ticket = ++this.copySourceTicket;
+        const source = this.copySources.find(row => row.id === id);
+        this.copyVersions = [];
+        this.form.version_id = "";
+        this.form.name = source ? `${source.name} · 副本`.slice(0, 200) : "";
+        this.formError = "";
+        this.copyVersionsLoading = true;
+        try {
+          const rows = [];
+          for (let offset = 0; id; offset += 200) {
+            const page = await api(`/datasets/${id}/versions?limit=200&offset=${offset}`);
+            rows.push(...page);
+            if (page.length < 200) break;
+          }
+          if (ticket !== this.copySourceTicket || this.modal !== "copyDataset") return;
+          this.copyVersions = rows.filter(row => row.sealed);
+          this.form.version_id = this.copyVersions[0]?.id || "";
+        } catch (error) { if (ticket === this.copySourceTicket) this.formError = error.message; }
+        finally { if (ticket === this.copySourceTicket) this.copyVersionsLoading = false; }
+      },
+      copySourceLabel(source) {
+        const project = this.projects.find(row => row.id === source.project_id);
+        return `${project?.name || "其他项目"} / ${source.name}`;
+      },
       /** 发布或异步提交中不允许误关表单导致操作状态丢失。
        * @returns {void} 无。
        */
+      deleteDataset() {
+        if (!this.currentDataset || this.datasetUploading || this.busy) return;
+        const dataset = this.currentDataset;
+        this.show("deleteAsset");
+        this.form = { kind: "dataset", id: dataset.id, name: dataset.name, confirm: "" };
+      },
+      deleteImage(image) {
+        if (this.datasetUploading || this.busy) return;
+        this.show("deleteAsset");
+        this.form = { kind: "image", id: image.id, name: image.original_name, confirm: "" };
+      },
+      async confirmDelete() {
+        if (this.busy || this.form.confirm !== this.form.name) return;
+        this.busy = true;
+        this.formError = "";
+        try {
+          const { kind, id, name } = this.form;
+          await api(`/${kind === "dataset" ? "datasets" : "images"}/${id}`, { method: "DELETE", body: { confirm_name: name } });
+          if (kind === "dataset") {
+            const versions = new Set(this.versions.filter(row => row.dataset_id === id).map(row => row.id));
+            this.datasets = this.datasets.filter(row => row.id !== id);
+            this.versions = this.versions.filter(row => !versions.has(row.id));
+            this.annotations = this.annotations.filter(row => !versions.has(row.version_id));
+            this.exports = this.exports.filter(row => !versions.has(row.version_id));
+            this.datasetId = this.datasets[0]?.id || "";
+            this.images = []; this.datasetVersions = []; this.datasetTasks = []; this.imageOffset = 0;
+          } else this.images = this.images.filter(row => row.id !== id);
+          this.busy = false;
+          this.closeDialog();
+          this.toast("已从工作区删除，封存版本与历史记录保持可追溯");
+          await this.refresh();
+        } catch (error) { this.formError = error.message; }
+        finally { this.busy = false; }
+      },
       closeDialog() {
         if (!this.busy) {
           this.$refs.dialog.close();
@@ -1318,6 +1565,7 @@
        * @returns {Promise<void>} 表单请求结束。
        */
       async submit() {
+        if (this.modal === "deleteAsset") return this.confirmDelete();
         if (this.busy) return;
         this.busy = true;
         this.formError = "";
@@ -1344,6 +1592,14 @@
             });
             this.datasetId = result.id;
             message = "数据集已创建，可以上传图片了";
+          }
+          if (this.modal === "copyDataset") {
+            if (!f.source_id || !f.name.trim() || this.copyVersionsLoading) throw new Error("请选择来源数据集并填写副本名称");
+            result = await api(`/datasets/${f.source_id}/copies`, {
+              method: "POST", body: { project_id: this.projectId, name: f.name.trim(), version_id: f.version_id || null },
+            });
+            this.datasetId = result.dataset_id;
+            message = "副本已创建，后台正在复制图片和所选版本；可在后台任务查看进度";
           }
           if (this.modal === "version") {
             result = await api(`/datasets/${this.datasetId}/versions`, {
@@ -1481,6 +1737,13 @@
       },
       /** 保留布尔、零值、冻结层列表以及自动 batch 的业务类型。 */
       parseTrainingValue(key, value) {
+        if (key === "tile") {
+          if (value === true || value === "true") return true;
+          if (value === false || value === "false") return false;
+          const size = Number(value);
+          if (!Number.isInteger(size) || size <= 0) throw new Error("tile 请填 true、false 或正整数窗口边长");
+          return size;
+        }
         if (["model", "optimizer"].includes(key) || (key === "batch" && value === "auto")) return value;
         if (["deterministic", "cos_lr", "rect", "pretrained"].includes(key)) {
           if (value === true || value === "true") return true;
@@ -1610,7 +1873,29 @@
             // 保留零基线，避免小幅波动被放大成趋势
             options(false, { min: 0 }),
           );
+        if (this.page === "train") for (const item of this.trainingMetricCharts) {
+          const canvas = document.getElementById(`metric-${item.key}`);
+          if (!canvas) continue;
+          const key = item.aliases.find(name => this.epochs.some(row => row[name] != null));
+          if (!key) { charts.get(`metric-${item.key}`)?.destroy(); charts.delete(`metric-${item.key}`); continue; }
+          this.chart(`metric-${item.key}`, canvas, { labels, datasets: [series(key, item.title, item.score ? colors[0] : colors[1])] }, options(false, item.score ? { min: 0, max: 1 } : {}));
+        }
       },
+      get trainingMetricCharts() {
+        return [
+          { key: "train-box", title: "训练 · 框 Loss", aliases: ["train/box_loss"] },
+          { key: "train-cls", title: "训练 · 分类 Loss", aliases: ["train/cls_loss"] },
+          { key: "train-l1", title: "训练 · L1 / DFL Loss", aliases: ["train/l1_loss", "train/dfl_loss"] },
+          { key: "precision", title: "验证 · Precision 精确率", aliases: ["metrics/precision(B)"], score: true },
+          { key: "recall", title: "验证 · Recall 召回率", aliases: ["metrics/recall(B)"], score: true },
+          { key: "val-box", title: "验证 · 框 Loss", aliases: ["val/box_loss"] },
+          { key: "val-cls", title: "验证 · 分类 Loss", aliases: ["val/cls_loss"] },
+          { key: "val-l1", title: "验证 · L1 / DFL Loss", aliases: ["val/l1_loss", "val/dfl_loss"] },
+          { key: "map50", title: "验证 · mAP50", aliases: ["metrics/mAP50(B)"], score: true },
+          { key: "map95", title: "验证 · mAP50–95", aliases: ["metrics/mAP50-95(B)"], score: true },
+        ].map(item => ({ ...item, available: this.epochs.some(row => item.aliases.some(key => row[key] != null)) }));
+      },
+      chartTitle(name) { return chartNames[name] || name; },
       /** 曲线和数据数组直接来自验证器，缺少类别支持时不补曲线。
        * @returns {void} 无。
        */
@@ -1749,6 +2034,65 @@
       short(value) {
         return value ? value.slice(0, 8) : "—";
       },
+      /** 名称用于理解，UUID 仅用于追溯；没有加载的历史实体不猜测身份。 */
+      entityLabel(kind, id) {
+        if (!id) return "尚未生成";
+        if (kind === "experiment") {
+          const row = this.experiments.find(item => item.id === id);
+          const iteration = this.agentIterations.find(item => item.experiment_id === id);
+          const parameters = row?.parameters || iteration?.plan?.parameters;
+          if (iteration) return `第 ${iteration.iteration + 1} 轮${parameters?.model ? ` · ${parameters.model.replace('.pt', '').toUpperCase()} / ${parameters.imgsz}px` : ""}`;
+          return row?.name || "历史实验（详情未加载）";
+        }
+        if (kind === "model") {
+          const row = this.models.find(item => item.id === id);
+          const best = this.agent?.state?.best_model;
+          const experimentId = row?.experiment_id || (best?.model_id === id ? best.experiment_id : null);
+          return experimentId ? `${this.entityLabel("experiment", experimentId)} · ${row?.kind === "last" ? "最后一次保存权重" : "最佳权重 best.pt"}` : "历史模型权重（详情未加载）";
+        }
+        if (kind === "task") {
+          const index = this.trainingTasks.findIndex(item => item.id === id);
+          return index >= 0 ? `训练尝试 ${this.trainingTasks.length - index}` : "历史训练尝试";
+        }
+        if (kind === "export") {
+          const row = this.exports.find(item => item.id === id);
+          const version = this.versions.find(item => item.id === row?.version_id);
+          const dataset = this.datasets.find(item => item.id === version?.dataset_id);
+          return row ? `${dataset?.name || "已审训练数据"}${version ? ` · v${version.number}` : ""} · ${row.summary?.image_count ?? "—"} 张` : "已审训练数据（详情未加载）";
+        }
+        if (kind === "version") {
+          const row = this.versions.find(item => item.id === id);
+          return row ? `v${row.number} · ${row.name}` : "历史数据版本";
+        }
+        if (kind === "annotation") {
+          const row = this.annotations.find(item => item.id === id);
+          return row ? `${row.total} 张 · ${this.time(row.created_at)}` : "历史标注批次";
+        }
+        if (kind === "evaluation") {
+          const row = this.evaluations.find(item => item.id === id);
+          return row ? `验证评估 · ${this.time(row.created_at)}` : "历史验证评估";
+        }
+        return "历史记录";
+      },
+      readableText(value) {
+        let result = String(value || "");
+        for (const [kind, rows] of [["experiment", this.experiments], ["model", this.models], ["task", this.trainingTasks], ["export", this.exports], ["annotation", this.annotations], ["version", this.versions]]) {
+          for (const row of rows) {
+            result = result.replaceAll(row.id, this.entityLabel(kind, row.id));
+            result = result.replace(new RegExp(`\\b${row.id.slice(0, 8)}\\b`, "g"), this.entityLabel(kind, row.id));
+          }
+        }
+        return result.replace(/\b[a-f0-9]{8}-[a-f0-9-]{27,}\b/gi, "关联记录（编号见原文）").replace(/\b[a-f0-9]{8}\b/gi, "历史记录（编号见原文）");
+      },
+      textPreview(value, limit = 110) {
+        const text = this.readableText(value).replace(/\s+/g, " ").trim();
+        if (text.length <= limit) return text;
+        const sentence = text.slice(0, limit).match(/^.*?[。！？；]/)?.[0];
+        return sentence || text.slice(0, limit) + "…";
+      },
+      textBlocks(value) {
+        return this.readableText(value).split(/\n\s*\n|\n|(?<=[。；])\s*(?=\S)/).map(text => text.trim()).filter(Boolean);
+      },
       /** 封闭状态映射避免把后端文本当作样式或 HTML。
        * @param {string} value 真实状态。
        * @returns {string} 中文状态。
@@ -1874,7 +2218,9 @@
             reviewed_import: "已审核数据导入",
             labeled_import: "已标注数据导入",
             dataset_export: "数据集导出",
+            dataset_copy: "跨项目复制数据集",
             import: "图片导入",
+            image_recheck: "重新检查异常原图",
             analysis: "质量分析",
             version: "版本封存",
             auto_annotate: "候选推理",
@@ -1883,6 +2229,31 @@
             yolo_export: "封存训练数据",
           }[kind] || kind
         );
+      },
+      taskProgressText(task) {
+        const detail = task?.progress_detail;
+        if (!detail) return "";
+        const count = `${detail.estimated ? "约 " : ""}${detail.completed_images} / ${detail.total_images} 张`;
+        const stages = {
+          preparing_images: `准备 CVAT 审核图片 · ${count}${detail.prepared_bytes ? ` · 已生成 ${this.bytes(detail.prepared_bytes)}` : ""}`,
+          preparing_or_uploading: "图片准备即将完成，等待 CVAT 接收；尚未完成上传",
+          connecting_cvat: "审核图片已准备完成，正在连接 CVAT",
+          uploading_images: "审核图片已准备完成，正在上传并由 CVAT 创建审核任务",
+          matching_frames: "CVAT 已接收图片，正在核对图片对应关系",
+          uploading_annotations: "正在向 CVAT 写入标注框与类别",
+          reading_review: "正在读取 CVAT 验收状态和审核结果",
+          validating_review: "正在核对图片、类别与标注框，并保存审核记录",
+          export_working: "正在核验图片、生成 YOLO 工件或压缩归档；当前任务未提供逐项进度",
+          export_verifying_review: "正在复核已保存的审核结果与 CVAT 标注是否一致",
+          export_preparing_images: `正在逐张核验原图与审核图片 · ${count}`,
+          export_writing_dataset: `图片核验完成，正在生成 YOLO 数据与标签 · 共 ${detail.total_images} 张`,
+          export_hashing: `正在校验工件指纹 · ${detail.completed_files || 0} / ${detail.total_files || 0} 个文件`,
+          export_archiving: `正在压缩可下载数据包${detail.archive_bytes ? ` · 已写入 ${this.bytes(detail.archive_bytes)}` : ""}`,
+          export_verifying_archive: "正在校验数据包并完成封存",
+        };
+        const text = stages[detail.stage] || "";
+        const elapsed = detail.elapsed_seconds;
+        return text && elapsed != null ? `${text} · 已用时 ${Math.floor(elapsed / 60)} 分 ${elapsed % 60} 秒` : text;
       },
       /** 部署格式的显示名。
        * @param {string} format 格式标识。
@@ -1922,7 +2293,7 @@
           return `${this.formatName(args.format)} · ${args.kind === "last" ? "最后轮" : "最佳轮"}权重`;
         if (tool === "finish") return args.summary || "";
         if (tool === "request_human_review") return (args.data_actions || []).join("；");
-        return args.experiment_id ? `实验 ${this.short(args.experiment_id)}` : "";
+        return args.experiment_id ? this.entityLabel("experiment", args.experiment_id) : "";
       },
       /** 每轮实验相对上一轮的参数变化。
        * @param {object} item 迭代记录。
@@ -1944,7 +2315,7 @@
           .filter(([key, value]) => before[key] !== value)
           .map(([key, value]) => `${key} ${before[key]}→${value}`);
         if (item.plan?.dataset_export_id && item.plan.dataset_export_id !== this.agentIterations[index - 1].plan?.dataset_export_id)
-          changes.push(`数据 → ${this.short(item.plan.dataset_export_id)}`);
+          changes.push(`数据 → ${this.entityLabel("export", item.plan.dataset_export_id)}`);
         return `旧记录相对上一轮 · ${changes.join(" · ") || "参数不变"}`;
       },
       /** 执行事件的中文名。
@@ -1978,6 +2349,13 @@
           }[event.event_type] || event.event_type
         );
       },
+      eventDetail(event) {
+        const payload = event.payload || {};
+        if (event.event_type === "tool_call") return [this.toolDetail(payload.tool, payload.arguments || {}), payload.arguments?.reason, payload.ok === false ? "执行被拒绝，展开原始记录查看原因" : ""].filter(Boolean).join("\n");
+        if (event.event_type === "validation_observed") return `第 ${payload.iteration + 1} 轮验证完成：mAP50–95 ${this.metric(payload.summary?.map50_95)}，mAP50 ${this.metric(payload.summary?.map50)}`;
+        if (event.event_type === "sealed") return payload.best_model ? this.entityLabel("model", payload.best_model.model_id) : "报告已封存，没有有效候选模型";
+        return payload.content || payload.reason || payload.message || (payload.experiment_id ? this.entityLabel("experiment", payload.experiment_id) : "");
+      },
       get globalNav() {
         return this.nav.filter(item => item.scope === "global");
       },
@@ -1991,7 +2369,7 @@
         return this.projects.find(project => project.id === this.projectId) || null;
       },
       projectName(id) {
-        return this.projects.find(project => project.id === id)?.name || this.short(id);
+        return this.projects.find(project => project.id === id)?.name || "历史项目";
       },
       get pageTitle() {
         return this.nav.find((x) => x.id === this.page)?.name || "项目列表";
@@ -2018,20 +2396,13 @@
       get currentAnnotation() {
         return this.annotations.find((x) => x.id === this.annotationId);
       },
+      get importedAnnotation() {
+        const run = this.currentAnnotation;
+        return Boolean(run && (run.model_version?.startsWith("external") || run.parameters?.review_attribution || this.versions.find(item => item.id === run.version_id)?.policy?.preserve_source_splits));
+      },
       get cvatEmbedUrl() {
-        const task = this.currentAnnotation?.cvat_task_id;
-        if (!/^[1-9]\d*$/.test(String(task || ""))) return "";
-        try {
-          const target = new URL(this.overview?.configuration?.cvat_url);
-          if (!["http:", "https:"].includes(target.protocol) || target.username || target.password) return "";
-          // 同机保持同一站点，使 CVAT 正常使用自身的 SameSite 登录 Cookie。
-          const loopback = ["localhost", "127.0.0.1"];
-          if (loopback.includes(target.hostname) && loopback.includes(location.hostname)) target.hostname = location.hostname;
-          if (location.protocol === "https:" && target.protocol === "http:") return "";
-          target.pathname = `${target.pathname.replace(/\/$/, "")}/tasks/${task}`;
-          target.search = target.hash = "";
-          return target.href;
-        } catch (_) { return ""; }
+        const run = this.currentAnnotation;
+        return run?.cvat_task_id && this.cvatSessionKey === `${run.id}:${run.cvat_task_id}` ? this.cvatSessionUrl : "";
       },
       get worker() {
         return this.runtime?.latest_worker?.runtime || null;
@@ -2060,7 +2431,8 @@
         return this.trainingReadback && selected && !choices.includes(Number(selected)) ? [...choices, Number(selected)] : choices;
       },
       get trainingModelChoices() {
-        return [...new Set([...this.preparedModels, ...(this.trainingReadback && this.trainForm.params.model ? [this.trainForm.params.model] : [])])];
+        const prepared = this.setupMode ? this.preparedModels.filter(name => this.agent.policy.allowed_models.includes(name)) : this.preparedModels;
+        return [...new Set([...prepared, ...(this.trainingReadback && this.trainForm.params.model ? [this.trainForm.params.model] : [])])];
       },
       get trainingOptimizerChoices() {
         return [...new Set([...(this.searchSpace.optimizer || this.trainingOptimizers), ...(this.trainingReadback && this.trainForm.params.optimizer ? [this.trainForm.params.optimizer] : [])])];
@@ -2070,6 +2442,7 @@
           {
             project: "创建项目",
             dataset: "新建数据集",
+            copyDataset: "复制其他项目的数据集",
             version: "封存分组版本",
             schema: "新建类别版本",
             annotate: "生成候选标注",
@@ -2078,6 +2451,7 @@
             resumeAgent: this.agent?.phase === "cvat_review" ? "确认 CVAT 审核完成" : "人工处理与恢复",
             publish: "确认生产发布",
             annotationImage: "标注只读预览",
+            deleteAsset: this.form.kind === "dataset" ? "删除数据集" : "删除已上传图片",
           }[this.modal] || ""
         );
       },
@@ -2118,7 +2492,7 @@
       },
       get trainingParameterSource() {
         const iteration = this.latestTrainingIteration;
-        return iteration ? `第 ${iteration.iteration + 1} 轮 · 实验 ${this.short(iteration.experiment_id)} · Agent 已选定` : "等待 Agent 规划首轮参数；已填写值保留显示";
+        return iteration ? `${this.entityLabel("experiment", iteration.experiment_id)} · Agent 已选定` : "等待 Agent 规划首轮参数；已填写值保留显示";
       },
       get classRows() {
         return this.pipeline.classes.filter((row) => row.name.trim() || row.prompt.trim());
@@ -2152,6 +2526,8 @@
               agent_review: "Agent 请求你处理",
             }[run.phase] || "等待人工处理"
           );
+        if (run.phase === "cvat_upload" && this.cvatTransfer?.progress_detail?.stage === "preparing_images")
+          return "正在准备 CVAT 审核图片";
         if (run.phase === "agent_sleep" && waiting.kind === "sleep")
           return `休眠中，预计 ${this.clock(waiting.until)} 醒来`;
         return this.phase(run.phase);
@@ -2159,6 +2535,9 @@
       get agentStateDetail() {
         const run = this.agent;
         if (!run) return "";
+        if (run.phase === "cvat_upload" && this.cvatTransfer) return this.taskProgressText(this.cvatTransfer);
+        if (["annotation_validation", "reviewed_export"].includes(run.phase) && this.reviewTransfer)
+          return this.taskProgressText(this.reviewTransfer) || this.reviewTransfer.error || "等待后台任务执行";
         const waiting = run.state?.waiting || {};
         if (run.phase === "agent_sleep" && waiting.kind === "sleep")
           return `${waiting.reason}。训练、评估或导出结束时会提前醒来。`;
@@ -2178,6 +2557,15 @@
                 ? "live"
                 : "muted";
       },
+      get cvatTransfer() {
+        return this.annotationTasks.find(task => task.kind === "cvat_push") || null;
+      },
+      get reviewTransfer() {
+        const kind = this.agent?.phase === "annotation_validation" ? "cvat_pull" : "yolo_export";
+        const waitingId = this.agent?.state?.waiting?.task_id;
+        return this.annotationTasks.find(task => task.id === waitingId && task.kind === kind)
+          || this.annotationTasks.find(task => task.kind === kind) || null;
+      },
       get pipelineStages() {
         const run = this.agent;
         if (!run) return [];
@@ -2187,7 +2575,7 @@
         const analysis = run.state?.dataset?.analysis;
         const stages = [
           { key: "inspect", name: "检查数据", phases: ["dataset_inspector", "data_quality_check"], detail: analysis ? `有效图片 ${analysis.valid_images} 张` : "" },
-          { key: "split", name: "划分 train / val / test 并封存", phases: ["dataset_split"], detail: run.dataset_version_id ? `版本 ${this.short(run.dataset_version_id)}` : "" },
+          { key: "split", name: "划分 train / val / test 并封存", phases: ["dataset_split"], detail: run.dataset_version_id ? this.entityLabel("version", run.dataset_version_id) : "" },
           {
             key: "annotate",
             name: "Grounding DINO 生成候选框",
@@ -2196,7 +2584,7 @@
             done: batch?.processed,
             total: batch && ["queued", "running"].includes(batch.status) ? batch.total : 0,
           },
-          { key: "cvat", name: "发送到 CVAT", phases: ["cvat_upload"], detail: batch?.cvat_task_id ? `CVAT 任务 #${batch.cvat_task_id}` : "" },
+          { key: "cvat", name: "准备审核图片并发送到 CVAT", phases: ["cvat_upload"], detail: batch?.cvat_task_id ? `CVAT 任务 #${batch.cvat_task_id}` : this.taskProgressText(this.cvatTransfer), done: this.cvatTransfer?.processed || 0, total: this.cvatTransfer && ACTIVE.includes(this.cvatTransfer.status) ? this.cvatTransfer.total : 0 },
         ];
         return stages.map((stage) => {
           const first = PHASE_ORDER.indexOf(stage.phases[0]);
@@ -2232,6 +2620,7 @@
               detail: p.ok ? this.toolDetail(p.tool, args) : `被拒绝：${error}`,
               reason: args.reason,
               tone: p.ok ? (p.tool === "sleep" ? "muted" : "info") : "danger",
+              stage: ({ start_experiment: "训练", stop_training: "训练", resume_training: "训练", evaluate: "评估", read_chart: "分析", read_confusion_matrix: "分析", get_experiment: "分析", read_training_log: "分析", suggest_parameters: "决策", sleep: "等待", finish: "收尾", export_model: "导出" })[p.tool] || "执行",
             };
           } else if (event.event_type === "model_decision" && p.content)
             item = { title: "Agent 说明", detail: p.content, tone: "muted" };
@@ -2253,12 +2642,21 @@
           else if (event.event_type === "failed")
             item = { title: `${this.phase(event.node)}失败`, detail: p.message, tone: "danger" };
           else if (event.event_type === "sealed")
-            item = { title: "运行报告已封存", detail: p.best_model ? `最佳权重 ${this.short(p.best_model.model_id)}` : "没有有效候选", tone: "success" };
+            item = { title: "运行报告已封存", detail: p.best_model ? this.entityLabel("model", p.best_model.model_id) : "没有有效候选", tone: "success" };
           else if (event.node === "operator" && ["pause", "resume", "stop"].includes(event.event_type))
             item = { title: { pause: "操作者暂停", resume: "操作者恢复", stop: "操作者停止" }[event.event_type], detail: p.reason || "", tone: "muted" };
-          if (item) items.push({ id: event.id, time: event.created_at, ...item });
+          if (item) items.push({ id: event.id, time: event.created_at, stage: "流程", ...item, preview: this.textPreview(item.detail), reasonPreview: this.textPreview(item.reason, 90), raw: JSON.stringify(p, null, 2) });
         }
         return items.reverse();
+      },
+      get trainingStages() {
+        const iteration = this.latestTrainingIteration;
+        const experiment = this.experiments.find(item => item.id === iteration?.experiment_id);
+        const terminated = ["stopped", "failed", "paused", "completed"].includes(this.agent?.status);
+        const trained = experiment?.status === "completed";
+        const evaluated = iteration?.conclusion?.map50_95 != null;
+        const index = !iteration ? 0 : !trained ? 1 : !evaluated ? 2 : 3;
+        return ["分析与规划", "训练模型", "验证与对比", "决定下一步"].map((name, at) => ({ name, state: at < index ? "done" : at === index ? (terminated ? this.agent.status : "current") : "todo", label: at < index ? "已完成" : at === index ? (terminated ? this.status(this.agent.status) : "进行中") : "等待" }));
       },
       get pendingActions() {
         const items = [];

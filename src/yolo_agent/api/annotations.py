@@ -15,6 +15,7 @@ from yolo_agent.schemas.agent import ClassDraftCreate
 from yolo_agent.schemas.dataset import TaskRead
 from yolo_agent.services.annotations import AnnotationService, annotation_digest
 from yolo_agent.services.annotation_quality import source_quality
+from yolo_agent.services.cvat_session import create_browser_session
 from yolo_agent.services.datasets import DatasetError, DatasetService, fail_dataset_task, owned_path
 from yolo_agent.settings import get_settings
 
@@ -127,7 +128,7 @@ def list_runs(version_id: str | None = None, project_id: str|None=None, limit: i
     :param service: 业务服务。
     :returns: 标注批次。
     """
-    statement = select(AnnotationRun).order_by(AnnotationRun.created_at.desc()).limit(limit).offset(offset)
+    statement = select(AnnotationRun).where(AnnotationRun.version_id.in_(select(DatasetVersion.id).join(Dataset).where(Dataset.deleted_at.is_(None)))).order_by(AnnotationRun.created_at.desc()).limit(limit).offset(offset)
     if project_id:
         statement=statement.join(DatasetVersion,DatasetVersion.id==AnnotationRun.version_id).join(Dataset,Dataset.id==DatasetVersion.dataset_id).where(Dataset.project_id==project_id)
     if version_id:
@@ -236,6 +237,19 @@ def review_image(run_id: str, image_id: str, data: ImageReviewCreate, service: A
     return service.review_image(run_id, image_id, data)
 
 
+@router.post("/annotation-runs/{run_id}/cvat-session")
+def browser_cvat_session(run_id: str, request: Request, service: AnnotationService = Depends(annotation_service)):
+    """只为已关联的真实审核任务建立浏览器会话，不改变审核状态。"""
+    with Session(service.engine) as session:
+        run = session.get(AnnotationRun, run_id)
+        if run is None:
+            raise DatasetError(404, "标注批次不存在")
+        if run.cvat_task_id is None:
+            raise DatasetError(409, "审核图片尚未发送完成，请等待 CVAT 任务生成")
+        task_id = run.cvat_task_id
+    return create_browser_session(service.settings, request, task_id)
+
+
 @router.post("/annotation-runs/{run_id}/cvat", response_model=TaskRead, status_code=202)
 def push_cvat(run_id: str, service: AnnotationService = Depends(annotation_service)):
     """异步上传方向一致的图片和待审核框到 CVAT。
@@ -281,7 +295,7 @@ def list_exports(run_id: str | None = None, project_id: str|None=None, limit: in
     :param service: 业务服务。
     :returns: 工件摘要。
     """
-    statement = select(DatasetExport).order_by(DatasetExport.created_at.desc()).limit(limit).offset(offset)
+    statement = select(DatasetExport).where(DatasetExport.version_id.in_(select(DatasetVersion.id).join(Dataset).where(Dataset.deleted_at.is_(None)))).order_by(DatasetExport.created_at.desc()).limit(limit).offset(offset)
     if project_id:
         statement=statement.join(DatasetVersion,DatasetVersion.id==DatasetExport.version_id).join(Dataset,Dataset.id==DatasetVersion.dataset_id).where(Dataset.project_id==project_id)
     if run_id:

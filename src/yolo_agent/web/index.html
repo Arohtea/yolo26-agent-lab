@@ -8,9 +8,9 @@
     <title>YOLO26 Lab</title>
     <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg" />
     <link rel="preload" href="/assets/vendor/inter.woff2" as="font" type="font/woff2" crossorigin />
-    <link rel="stylesheet" href="/assets/app.css" />
+    <link rel="stylesheet" href="/assets/app.css?v=20261113-evaluation-images1" />
     <script defer src="/assets/vendor/chart.min.js?v=4.5.1"></script>
-    <script defer src="/assets/app.js"></script>
+    <script defer src="/assets/app.js?v=20261113-dataset-copy1"></script>
     <script defer src="/assets/vendor/alpine.min.js?v=3.15.8"></script>
   </head>
   <body>
@@ -69,6 +69,17 @@
         </template>
       </header>
 
+      <aside class="upload-center" x-show="uploads.length" aria-label="上传任务中心">
+        <div class="upload-center-head"><strong>上传任务</strong><span class="hint">可切换站内页面 · 传输时请保留此标签页</span></div>
+        <template x-for="item in uploads" :key="item.key">
+          <div class="transfer-row" :class="{'is-error':item.phase==='failed'||item.phase==='unknown'}">
+            <div class="transfer-info"><strong x-text="`${item.projectName} / ${item.datasetName}`"></strong><span class="hint" x-text="`${item.count} 个文件 · ${transferText(item)}`"></span><p class="danger-text" x-show="item.error" x-text="item.error"></p></div>
+            <div class="transfer-progress"><progress :value="['queued','running','completed'].includes(item.phase)?item.processed:item.loaded" :max="['queued','running','completed'].includes(item.phase)?(item.taskTotal||item.count):(item.total||1)" :aria-label="transferText(item)"></progress><small class="num" x-text="['uploading','receiving'].includes(item.phase)?`${bytes(item.loaded)} / ${bytes(item.total)}`:transferText(item)"></small></div>
+            <button type="button" class="button small danger-outline" x-show="['uploading','receiving','canceling'].includes(item.phase)" :disabled="item.phase==='canceling'" @click="cancelTransfer(item)" x-text="item.phase==='canceling'?'正在取消…':'取消上传'"></button>
+            <button type="button" class="button quiet small" x-show="['completed','stopped','failed'].includes(item.phase)" @click="uploads=uploads.filter(row=>row.key!==item.key)">收起</button>
+          </div>
+        </template>
+      </aside>
       <div class="workspace">
         <main id="main" tabindex="-1">
           <div class="alert warning" role="status" x-show="routeNotice"><p x-text="routeNotice"></p><button class="link" type="button" @click="routeNotice=''">收起</button></div>
@@ -321,6 +332,8 @@
                       </template>
                     </select>
                     <button class="button" :disabled="busy" @click="show('dataset')">＋ 新建数据集</button>
+                    <button type="button" class="button" :disabled="busy" @click="openDatasetCopy()">从其他项目复制</button>
+                    <button type="button" class="button danger-outline" x-show="datasetId" :disabled="busy||datasetUploading" @click="deleteDataset()">删除数据集</button>
                   </div>
                 </div>
                 <div class="empty" x-show="!datasets.length">
@@ -341,7 +354,7 @@
                       <span
                         x-text="`JPG / PNG / WEBP · 单批最多 ${limits.files??'—'} 张 · 文件大小不限`"
                       ></span>
-                      <input type="file" x-ref="uploadFiles" accept=".jpg,.jpeg,.png,.webp" multiple @change="uploadCount=$event.target.files.length" />
+                      <input type="file" x-ref="uploadFiles" accept=".jpg,.jpeg,.png,.webp" multiple :disabled="datasetUploading" @change="uploadCount=$event.target.files.length" />
                     </label>
                     <details>
                       <summary>按视频、场景或采集批次分组（可选）</summary>
@@ -353,7 +366,7 @@
                     </details>
                     <div class="row spread">
                       <span class="hint" x-text="images.length?`本页 ${images.length} 张，导入后自动检查损坏与重复`:'还没有图片'"></span>
-                      <button class="button primary" @click="uploadImages()" :disabled="busy||!uploadCount">上传图片</button>
+                      <button class="button primary" @click="uploadImages()" :disabled="busy||datasetUploading||!uploadCount">上传图片</button>
                     </div>
                     </div>
                     <div class="stack" x-show="uploadMode==='labeled'">
@@ -379,16 +392,13 @@
                         <label class="field">审核来源说明<textarea x-model="labeledUpload.confirmation" maxlength="4000" rows="2" :disabled="busy" placeholder="说明谁在何处完成审核及漏标检查"></textarea></label>
                       </div>
                       <p class="hint">默认作为待审核标注导入。越界框会裁剪并记录，受影响图片须重新审核。</p>
-                      <div x-show="labeledUpload.progress!==null" role="status" aria-live="polite">
-                        <progress :value="labeledUpload.progress??0" max="100" aria-label="已标注数据集上传进度"></progress>
-                        <p class="hint" x-text="labeledUpload.progress===100?'上传完成，正在接收文件并登记后台任务…':`正在上传 ${labeledUpload.progress??0}%`"></p>
-                      </div>
-                      <button class="button primary" @click="uploadLabeledDataset()" :disabled="busy||!labeledUpload.count" x-text="labeledUpload.progress!==null?'正在上传…':'上传已标注数据集'"></button>
+                      <button class="button primary" @click="uploadLabeledDataset()" :disabled="busy||datasetUploading||!labeledUpload.count" x-text="datasetUploading?'本数据集正在上传或处理':'上传已标注数据集'"></button>
                     </div>
                     <div class="alert danger" role="alert" x-show="inlineError"><p x-text="inlineError"></p></div>
                     <div class="image-grid" x-show="images.length">
                       <template x-for="image in images" :key="image.id">
                         <article class="image-card">
+                          <button type="button" class="image-open" :disabled="image.status!=='valid'" :aria-label="`查看原图：${image.original_name}`" @click="openImage(`/api/v1/images/${image.id}/view`,image.original_name)">
                           <img
                             x-show="image.status==='valid'"
                             :src="image.status==='valid'?`/api/v1/images/${image.id}/preview`:''"
@@ -396,12 +406,14 @@
                             loading="lazy"
                           />
                           <div class="image-unavailable" x-show="image.status!=='valid'">无法预览</div>
+                          </button>
                           <div class="image-caption">
                             <strong x-text="image.original_name" :title="image.original_name"></strong>
                             <div class="row">
                               <span class="badge" :class="tone(image.status)" x-text="status(image.status)"></span>
                               <small class="num" x-text="image.width?`${image.width}×${image.height}`:image.error||'等待检查'"></small>
                             </div>
+                            <div class="row spread"><button type="button" class="link small" :disabled="image.status!=='valid'" @click="openImage(`/api/v1/images/${image.id}/view`,image.original_name)">查看大图</button><button type="button" class="link danger-text small" :disabled="busy||datasetUploading" @click="deleteImage(image)">删除图片</button></div>
                           </div>
                         </article>
                       </template>
@@ -475,7 +487,7 @@
                         <template x-if="row.source==='project_model'">
                           <select x-model="row.model_id" :aria-label="`第 ${index+1} 类项目模型`">
                             <option value="">选择项目模型</option>
-                            <template x-for="model in sourceModels(row)" :key="model.model_id"><option :value="model.model_id" :selected="model.model_id===row.model_id" x-text="`${model.base_model} · ${short(model.model_id)}`"></option></template>
+                            <template x-for="model in sourceModels(row)" :key="model.model_id"><option :value="model.model_id" :selected="model.model_id===row.model_id" x-text="`${model.base_model} · ${entityLabel('model',model.model_id)}`"></option></template>
                           </select>
                         </template>
                       </div>
@@ -554,6 +566,7 @@
                 </div>
                 <div class="actions">
                   <button class="button quiet small" :disabled="busy" @click="action(`/datasets/${datasetId}/analyses`,'分析任务已提交')">单独分析质量</button>
+                  <button class="button quiet small" :disabled="busy||datasetUploading" @click="action(`/datasets/${datasetId}/image-rechecks`,'异常原图重新检查已提交')">重新检查异常原图</button>
                   <button class="button quiet small" :disabled="busy" @click="show('version')">手动封存版本</button>
                 </div>
               </section>
@@ -566,14 +579,16 @@
                   <template x-for="task in datasetTasks" :key="task.id">
                     <div class="task">
                       <div class="row spread">
-                        <strong x-text="taskName(task.kind)"></strong>
+                        <strong x-text="task.status==='uploading'?'等待上传完成':taskName(task.kind)"></strong>
                         <span class="badge" :class="tone(task.status)" x-text="status(task.status)"></span>
                       </div>
                       <progress x-show="task.total>0" :value="task.processed" :max="task.total" :aria-label="`${task.processed}/${task.total}`"></progress>
+                      <button type="button" class="link" x-show="task.status==='uploading'" @click="cancelDatasetUpload(task.id)">取消这次上传</button>
+                      <p class="hint" x-show="task.progress_detail" x-text="taskProgressText(task)"></p>
                       <p class="danger-text" x-show="task.error" x-text="task.error"></p>
                       <a
                         class="link"
-                        x-show="task.status==='completed'&&['analysis','version','import','labeled_import','dataset_export'].includes(task.kind)"
+                        x-show="task.status==='completed'&&['analysis','version','import','image_recheck','labeled_import','dataset_export'].includes(task.kind)"
                         :href="`/api/v1/dataset-tasks/${task.id}/report`"
                         target="_blank"
                         rel="noopener"
@@ -591,11 +606,12 @@
 
           <!-- 2 自动标注 -->
           <section class="view" x-show="page==='annotate'&&projectId" aria-label="自动标注">
-            <div class="panel empty" x-show="!agent">
+            <div class="panel empty" x-show="!agent&&!importedAnnotation">
               <h2>还没有流程</h2>
               <p>先在第 1 步上传原图并写下需求，系统会接着完成自动标注。</p>
               <button class="button primary" @click="navigate('upload')">去上传 →</button>
             </div>
+            <section class="panel" x-show="importedAnnotation"><div class="panel-head"><div><h2>已导入现成标注</h2><p class="meta">保留上传的标签，不再生成自动候选框</p></div><span class="badge success">自动标注已跳过</span></div><p class="hint" x-text="['reviewed','exported'].includes(currentAnnotation?.status)?'已有审核结果已保留，可查看标签或前往训练。':'标签校验已完成，请继续逐图审核和漏标检查。'"></p><div class="actions"><button type="button" class="button primary" @click="navigate('review')">查看标注与审核 →</button></div></section>
             <template x-if="agent">
               <div class="grid-main">
                 <section class="panel">
@@ -626,7 +642,7 @@
                 <section class="panel">
                   <div class="panel-head">
                     <h2>后台任务</h2>
-                    <span class="meta" x-text="currentAnnotation?`批次 ${short(currentAnnotation.id)}`:'等待生成候选'"></span>
+                    <span class="meta" x-text="currentAnnotation?`标注批次 · ${entityLabel('annotation',currentAnnotation.id)}`:'等待生成候选'"></span>
                   </div>
                   <div class="list">
                     <template x-for="task in annotationTasks" :key="task.id">
@@ -638,6 +654,7 @@
                         <div class="meta">
                           <time x-text="time(task.finished_at||task.started_at||task.created_at)"></time>
                         </div>
+                        <p class="hint" x-show="task.progress_detail" x-text="taskProgressText(task)"></p>
                         <progress x-show="task.total>0" :value="task.processed" :max="task.total" :aria-label="`${task.processed}/${task.total}`"></progress>
                         <p class="danger-text" x-show="task.error" x-text="task.error"></p>
                       </div>
@@ -652,7 +669,7 @@
               <div class="grid-2">
                 <section class="panel">
                   <div class="panel-head">
-                    <h2>候选框统计</h2>
+                    <h2 x-text="importedAnnotation?'导入标签统计':'候选框统计'"></h2>
                     <span class="meta" x-text="`${currentAnnotation.processed}/${currentAnnotation.total} 图`"></span>
                   </div>
                   <div class="table-scroll">
@@ -687,7 +704,7 @@
                 </section>
                 <section class="panel">
                   <div class="panel-head">
-                    <h2>候选预览</h2>
+                    <h2 x-text="importedAnnotation?'导入标签预览':'候选预览'"></h2>
                     <span class="meta">点击查看框</span>
                   </div>
                   <div class="image-grid compact">
@@ -708,7 +725,7 @@
               <div class="row mt">
                 <select aria-label="标注批次" x-show="annotations.length" x-model="annotationId" @change="read(chooseAnnotation(annotationId))">
                   <template x-for="run in annotations" :key="run.id">
-                    <option :value="run.id" :selected="run.id===annotationId" x-text="`${short(run.id)} · ${status(run.status)} · ${run.total} 图`"></option>
+                    <option :value="run.id" :selected="run.id===annotationId" x-text="`${entityLabel('annotation',run.id)} · ${status(run.status)}`"></option>
                   </template>
                 </select>
                 <button class="button" @click="show('schema')">新建类别版本</button>
@@ -746,16 +763,18 @@
             </template>
             <section class="panel" x-show="agent&&['annotation_validation','reviewed_export'].includes(agent.phase)">
               <div class="panel-head">
-                <h2>正在回传审核结果并封存训练数据</h2>
-                <span class="badge info">处理中</span>
+                <h2 x-text="agent?.status==='failed'?'审核回传或数据封存失败':agent?.phase==='annotation_validation'?'正在回传审核结果':'审核已回传，正在封存训练数据'"></h2>
+                <span class="badge" :class="agent?.status==='failed'?'danger':'info'" x-text="agent?.status==='failed'?'失败':agent?.status==='paused'?'已暂停':'处理中'"></span>
               </div>
-              <p class="hint">服务会再次核对 CVAT 验收状态和实际框，完成后进入训练步骤。</p>
+              <p class="hint" x-text="agent?.error||taskProgressText(reviewTransfer)||'等待后台任务执行，服务会核对 CVAT 验收状态和实际框。'"></p>
+              <progress x-show="reviewTransfer?.status==='running'&&reviewTransfer?.progress_detail?.stage==='export_preparing_images'" aria-label="核验封存图片" :value="reviewTransfer?.processed||0" :max="reviewTransfer?.total||1"></progress>
+              <p class="hint mt">可切换页面，后台会继续。图片核验、文件写入与压缩完成后才会进入训练步骤，请勿重复回传。</p>
             </section>
             <section class="panel success-card" x-show="agent&&flowStep>=4&&!reusedExport">
               <div class="panel-head">
                 <div>
                   <h2>人工审核已通过</h2>
-                  <p class="meta" x-text="`训练数据 ${short(agent?.dataset_export_id)} 已封存`"></p>
+                  <p class="meta" x-text="`${entityLabel('export',agent?.dataset_export_id)} · 已封存`"></p>
                 </div>
                 <button class="button primary" @click="navigate('train')">前往训练 →</button>
               </div>
@@ -771,22 +790,25 @@
             <template x-if="page==='review'&&cvatEmbedUrl">
               <section id="cvat-review" class="panel cvat-review-panel">
                 <div class="panel-head">
-                  <div><h2>人工审核工作区</h2><p class="meta" x-text="`CVAT 任务 ${currentAnnotation.cvat_task_id} · 批次 ${short(annotationId)}`"></p></div>
-                  <span class="badge info">CVAT 编辑器</span>
+                  <div><h2>人工审核工作区</h2><p class="meta" x-text="`CVAT 任务 #${currentAnnotation.cvat_task_id} · ${entityLabel('annotation',annotationId)}`"></p></div>
+                  <div class="row"><span class="badge success">工作台会话已连接</span><button type="button" class="button quiet small" @click="connectCvat(true)" :disabled="cvatConnecting">重新连接</button></div>
                 </div>
-                <p class="hint">首次使用请在下方登录 CVAT。进入作业逐图审核，保存修改并完成验收后，再点击本页的审核确认或回传按钮。</p>
+                <p class="hint">已自动连接审核账户。进入作业逐图审核，保存修改并完成验收后，再点击本页的审核确认或回传按钮。</p>
                 <iframe :key="annotationId" :src="cvatEmbedUrl" title="CVAT 人工标注与审核编辑器" referrerpolicy="strict-origin-when-cross-origin" allow="fullscreen" allowfullscreen></iframe>
               </section>
             </template>
-            <div class="alert warning" role="status" x-show="page==='review'&&currentAnnotation?.cvat_task_id&&!cvatEmbedUrl">
-              <p>审核服务地址不可嵌入，请检查 CVAT 公共地址；HTTPS 工作台需要 HTTPS 审核服务。</p>
+            <div class="panel" role="status" x-show="page==='review'&&currentAnnotation?.cvat_task_id&&!cvatEmbedUrl">
+              <h2 x-text="cvatConnecting?'正在连接人工审核工作区':'审核工作区尚未连接'"></h2>
+              <p class="hint" x-show="cvatConnecting">工作台正在建立安全会话，无需再次输入 CVAT 账号密码。</p>
+              <p class="danger-text" role="alert" x-show="cvatError" x-text="cvatError"></p>
+              <button type="button" class="button" @click="connectCvat(true)" :disabled="cvatConnecting" x-text="cvatConnecting?'正在连接…':'重新连接审核区'"></button>
             </div>
 
             <div class="grid-2">
               <section class="panel">
                 <div class="panel-head">
                   <h2>类别审核统计</h2>
-                  <span class="meta" x-text="currentAnnotation?`批次 ${short(currentAnnotation.id)}`:''"></span>
+                  <span class="meta" x-text="currentAnnotation?entityLabel('annotation',currentAnnotation.id):''"></span>
                 </div>
                 <div class="table-scroll">
                   <table>
@@ -826,8 +848,8 @@
               <section class="panel" x-show="currentAnnotation&&currentAnnotation.id!==agent?.state?.annotation_run_id">
                 <div class="panel-head">
                   <div>
-                    <h2>手动批次审核</h2>
-                    <p class="meta" x-text="`批次 ${short(currentAnnotation?.id)} · ${status(currentAnnotation?.status)}`"></p>
+                    <h2 x-text="importedAnnotation?'上传标签的审核与封存':'手动批次审核'"></h2>
+                    <p class="meta" x-text="`标注批次 · ${entityLabel('annotation',currentAnnotation?.id)} · ${status(currentAnnotation?.status)}`"></p>
                   </div>
                 </div>
                 <div class="actions">
@@ -885,7 +907,7 @@
                   <tbody>
                     <template x-for="item in exports" :key="item.id">
                       <tr>
-                        <td><code x-text="short(item.id)"></code> <small class="hint" x-text="time(item.created_at)"></small></td>
+                        <td><span x-text="entityLabel('export',item.id)"></span> <small class="hint" x-text="time(item.created_at)"></small><details class="technical-details"><summary>技术编号</summary><code x-text="item.id"></code></details></td>
                         <td class="num" x-text="item.summary.image_count??'—'"></td>
                         <td class="num" x-text="item.summary.annotation_count??'—'"></td>
                         <td
@@ -911,7 +933,7 @@
                 <div class="class-set">
                   <div class="row">
                     <strong x-text="schema.name"></strong>
-                    <code x-text="short(schema.id)"></code>
+                    <details class="technical-details"><summary>类别版本编号</summary><code x-text="schema.id"></code></details>
                   </div>
                   <div class="chips">
                     <template x-for="category in schema.classes" :key="category.class_id">
@@ -934,7 +956,7 @@
                 <div class="panel-head">
                   <div>
                     <h2 x-text="trainingReadback?'Agent 训练参数':setupMode?'确认参数并开始训练':'从已审数据开始训练'"></h2>
-                    <p class="meta" aria-live="polite" x-text="trainingReadback?trainingParameterSource:setupMode?`训练数据 ${short(agent?.dataset_export_id)} 已封存`:'选择一份已人审封存的数据，Agent 在预算内自主迭代'"></p>
+                    <p class="meta" aria-live="polite" x-text="trainingReadback?trainingParameterSource:setupMode?`${entityLabel('export',agent?.dataset_export_id)} · 已封存`:'选择一份已人审封存的数据，Agent 在预算内自主迭代'"></p>
                   </div>
                   <button class="link" type="button" x-show="showTrainForm" :disabled="busy" @click="presetLocal()">填入本机验证预设</button>
                 </div>
@@ -947,7 +969,7 @@
                           <option
                             :value="item.id"
                             :selected="item.id===trainForm.exportId"
-                            x-text="`${short(item.id)} · ${item.summary.image_count??'—'} 图 · ${time(item.created_at)}`"
+                            x-text="`${entityLabel('export',item.id)} · ${time(item.created_at)}`"
                           ></option>
                         </template>
                       </select></label
@@ -960,7 +982,7 @@
                 </template>
                 <fieldset :disabled="busy||trainingReadback">
                   <legend><span x-text="trainingReadback?'本轮参数':'首轮参数'"></span> <span class="legend-note" x-text="trainingReadback?'只读':'可选'"></span></legend>
-                  <p class="hint" x-text="trainingReadback?'Agent 选定的实验配置会自动回填，后续轮次随决策更新。训练库实际采用值可在下方实验详情查看。':'留空由 Agent 决定。填写的值只约束第一轮，之后 Agent 会根据评估结果调整。'"></p>
+                  <p class="hint" x-text="trainingReadback?'Agent 选定的实验配置会自动回填，后续轮次随决策更新。训练库实际采用值可在下方实验详情查看。':'留空由 Agent 决定。普通参数只约束首轮；勾选锁定模型后，所有轮次都使用所选基座。'"></p>
                   <div class="form-grid param-grid">
                     <label class="field"
                       >模型<select x-model="trainForm.params.model">
@@ -998,6 +1020,7 @@
                         placeholder="Agent 决定"
                     /></label>
                   </div>
+                  <label class="checkbox-field model-lock"><input type="checkbox" x-model="trainForm.lockModel" /><span><strong>锁定基座模型，应用于所有轮次</strong><small class="hint block" x-text="trainForm.lockModel?(trainForm.params.model?`后端仅允许 ${trainForm.params.model}，Agent 不能切换型号`:'请先在上方选择模型'):'未锁定：Agent 可在本次允许范围内调整模型型号'"></small></span></label>
                   <template x-for="group in trainingParameterGroups" :key="group.name">
                     <details class="parameter-group">
                       <summary><span x-text="group.name"></span><small class="hint" x-text="`${group.fields.length} 项`"></small></summary>
@@ -1014,6 +1037,7 @@
                               </select>
                             </template>
                             <template x-if="field.control==='layers'"><input x-model="trainForm.params[field.name]" placeholder="0 或 [0,1,2]" /></template>
+                            <template x-if="field.control==='tile'"><input x-model="trainForm.params[field.name]" list="tile-values" placeholder="Agent 决定 · false / true / 像素" /></template>
                             <template x-if="field.control==='number'&&!parameterIsSelect(field)">
                               <input type="number" :min="parameterBound(field,'min')" :max="parameterBound(field,'max')" :step="field.type==='integer'?1:'any'" x-model="trainForm.params[field.name]" :placeholder="`Agent 决定 · 默认 ${field.default}`" />
                             </template>
@@ -1071,7 +1095,8 @@
                   <div>
                     <span class="label" x-text="agent.policy.purpose==='development_validation'?'软件闭环验收':'模型优化'"></span>
                     <h2 x-text="agentStateText"></h2>
-                    <p class="meta pre-wrap" x-show="agentStateDetail" x-text="agentStateDetail"></p>
+                    <p class="meta" x-show="agentStateDetail" x-text="textPreview(agentStateDetail,150)"></p>
+                    <details class="text-details" x-show="agentStateDetail"><summary>完整说明与判断依据</summary><div class="reading-copy"><template x-for="(block,index) in textBlocks(agentStateDetail)" :key="index"><p x-text="block"></p></template></div></details>
                   </div>
                   <div class="row">
                     <button
@@ -1163,6 +1188,8 @@
                     </ul>
                   </div>
                 </template>
+                <ol class="training-stages" aria-label="当前轮次 Agent 步骤"><template x-for="(stage,index) in trainingStages" :key="stage.name"><li :class="`is-${stage.state}`"><span class="stage-number" x-text="stage.state==='done'?'✓':index+1"></span><div><strong x-text="stage.name"></strong><small x-text="stage.label"></small></div></li></template></ol>
+                <p class="hint" x-text="agent.policy.allowed_models.length===1?`已锁定基座：${agent.policy.allowed_models[0]}（所有轮次）`:`允许基座：${agent.policy.allowed_models.join('、')}`"></p>
                 <p class="danger-text mt" x-show="agent.error" x-text="agent.error"></p>
               </section>
             </template>
@@ -1199,16 +1226,11 @@
                     <p class="danger-text" x-show="trainingTasks[0].error" x-text="trainingTasks[0].error"></p>
                   </div>
                 </template>
-                <div class="chart-pair" x-show="epochs.length">
-                  <div>
-                    <h3>Loss</h3>
-                    <div class="chart-wrap"><canvas id="training-loss" role="img" aria-label="真实训练 Loss 随 epoch 变化"></canvas></div>
-                  </div>
-                  <div>
-                    <h3>验证 mAP50–95</h3>
-                    <div class="chart-wrap"><canvas id="training-map" role="img" aria-label="验证集 mAP50–95 随 epoch 变化"></canvas></div>
-                  </div>
+                <div class="metric-chart-grid" x-show="epochs.length">
+                  <template x-for="item in trainingMetricCharts" :key="item.key"><article class="metric-chart"><h3 x-text="item.title"></h3><div class="chart-wrap" x-show="item.available"><canvas :id="`metric-${item.key}`" role="img" :aria-label="`${item.title} 随 epoch 变化`"></canvas></div><p class="metric-empty" x-show="!item.available">尚无此指标记录</p></article></template>
                 </div>
+                <p class="hint" x-show="epochs.length">横轴为实际 epoch；Loss 越低越好，精确率、召回率和 mAP 越高越好。缺失指标保留为空。</p>
+                <details class="result-gallery" x-show="trainingCharts.length"><summary>结果图与验证样例 <span class="hint" x-text="`${trainingCharts.length} 张 · 点击放大查看`"></span></summary><div class="artifact-grid"><template x-for="chart in trainingCharts" :key="chart.url"><a :href="chart.url" @click.prevent="openImage(chart.url,chartTitle(chart.name))" target="_blank" rel="noopener"><strong x-text="chartTitle(chart.name)"></strong><img :src="chart.url" :alt="chartTitle(chart.name)" loading="lazy" /></a></template></div></details>
                 <p class="empty compact" x-show="!epochs.length">训练开始后显示曲线。</p>
                 <div class="actions" x-show="experiment">
                   <button
@@ -1250,8 +1272,10 @@
                       <time x-text="clock(item.time)"></time>
                       <div>
                         <strong x-text="item.title"></strong>
-                        <p x-show="item.detail" x-text="item.detail"></p>
-                        <p class="act-reason" x-show="item.reason" x-text="item.reason"></p>
+                        <span class="activity-stage" x-text="item.stage"></span>
+                        <p x-show="item.detail" x-text="item.preview"></p>
+                        <p class="act-reason" x-show="item.reason" x-text="item.reasonPreview"></p>
+                        <details class="text-details" x-show="item.detail||item.reason"><summary>查看依据与详情</summary><div class="reading-copy"><template x-for="(block,index) in textBlocks(item.detail)" :key="`detail-${index}`"><p x-text="block"></p></template><template x-for="(block,index) in textBlocks(item.reason)" :key="`reason-${index}`"><p x-text="block"></p></template></div><details class="technical-details"><summary>原始记录与技术编号</summary><pre x-text="item.raw"></pre></details></details>
                       </div>
                     </li>
                   </template>
@@ -1284,7 +1308,7 @@
                         </td>
                         <td class="mono small" x-text="changeSummary(item)"></td>
                         <td class="reason-cell">
-                          <p x-text="item.plan.reason"></p>
+                          <p x-text="textPreview(item.plan.reason,100)"></p><details class="text-details"><summary>完整调参理由</summary><div class="reading-copy"><template x-for="(block,index) in textBlocks(item.plan.reason)" :key="index"><p x-text="block"></p></template></div></details>
                           <small x-show="item.conclusion?.causal_limit" x-text="item.conclusion?.causal_limit"></small>
                         </td>
                         <td class="num" x-text="item.conclusion?.abandoned?'已放弃':metric(item.conclusion?.map50_95)"></td>
@@ -1304,7 +1328,7 @@
               <section class="panel console-panel">
                 <div class="panel-head">
                   <h2>训练日志</h2>
-                  <code x-text="short(trainingTaskId)"></code>
+                  <span class="meta" :title="`训练任务完整编号：${trainingTaskId}`" x-text="entityLabel('task',trainingTaskId)"></span>
                 </div>
                 <pre class="training-log" x-text="trainingLogs||'当前没有日志输出。'"></pre>
               </section>
@@ -1316,9 +1340,10 @@
                   <template x-for="task in trainingTasks" :key="task.id">
                     <div class="list-row">
                       <div>
-                        <code x-text="short(task.id)"></code>
-                        <span class="hint" x-text="task.parent_task_id?`恢复自 ${short(task.parent_task_id)}`:'新训练尝试'"></span>
+                        <strong x-text="entityLabel('task',task.id)"></strong>
+                        <span class="hint" x-text="task.parent_task_id?`从${entityLabel('task',task.parent_task_id)}的检查点恢复`:'从预训练基座开始'"></span>
                         <time class="hint" x-text="time(task.started_at||task.created_at)"></time>
+                        <details class="technical-details"><summary>训练任务编号</summary><code x-text="task.id"></code><small class="hint">系统内部唯一标识，用于日志追溯</small></details>
                       </div>
                       <span class="badge" :class="tone(task.status)" x-text="status(task.status)"></span>
                     </div>
@@ -1341,7 +1366,7 @@
                   <div>
                     <span class="label" x-text="exportCandidate.source"></span>
                     <h2 x-text="`第 ${exportCandidate.iteration+1} 轮 · ${exportCandidate.kind==='best'?'最佳轮权重':'最后轮权重'}`"></h2>
-                    <p class="meta" x-text="`实验 ${short(exportCandidate.experiment_id)} · 权重 ${short(exportCandidate.model_id)}`"></p>
+                    <p class="meta" x-text="entityLabel('model',exportCandidate.model_id)"></p>
                   </div>
                   <span class="badge plain" x-text="exportCandidate.model_id===overview?.production_model_id?'当前生产模型':'未发布 · 需人工确认'"></span>
                 </div>
@@ -1389,7 +1414,7 @@
                   <span
                     class="badge"
                     :class="overview?.production_model_id?'success':'neutral'"
-                    x-text="overview?.production_model_id?short(overview.production_model_id):'尚未发布'"
+                    x-text="overview?.production_model_id?entityLabel('model',overview.production_model_id):'尚未发布'"
                   ></span>
                 </span>
               </div>
@@ -1408,11 +1433,11 @@
                     <template x-for="item in models" :key="item.id">
                       <tr>
                         <td>
-                          <strong x-text="item.kind==='best'?'最佳轮':'最后轮'"></strong>
-                          <code x-text="short(item.id)"></code>
+                          <strong x-text="entityLabel('model',item.id)"></strong>
+                          <details class="technical-details"><summary>权重编号</summary><code x-text="item.id"></code><small class="hint">内部唯一标识；best.pt 为本次训练保存的最佳权重</small></details>
                         </td>
                         <td>
-                          <button class="link mono" @click="experimentId=item.experiment_id;navigate('experiments')" x-text="short(item.experiment_id)"></button>
+                          <button class="link" @click="experimentId=item.experiment_id;navigate('experiments')" x-text="entityLabel('experiment',item.experiment_id)"></button>
                         </td>
                         <td><span class="badge" :class="tone(item.status)" x-text="status(item.status)"></span></td>
                         <td>
@@ -1454,7 +1479,7 @@
                 <template x-for="item in publications" :key="item.id">
                   <div class="list-row">
                     <div>
-                      <strong x-text="`${short(item.model_id)} · ${item.reviewer}`"></strong>
+                      <strong x-text="`${entityLabel('model',item.model_id)} · 审核者 ${item.reviewer}`"></strong>
                       <p class="small" x-text="item.reason"></p>
                       <time class="hint" x-text="time(item.created_at)"></time>
                     </div>
@@ -1518,7 +1543,7 @@
                         <td><input type="checkbox" :value="item.id" x-model="compareIds" :aria-label="`选择实验 ${item.name}`" /></td>
                         <td>
                           <strong x-text="item.name"></strong>
-                          <code x-text="short(item.id)"></code>
+                          <details class="technical-details"><summary>实验编号</summary><code x-text="item.id"></code><small class="hint">内部唯一标识，用于日志追溯</small></details>
                         </td>
                         <td>
                           <span x-text="`${item.parameters.model} · ${item.parameters.imgsz} · ${item.parameters.epochs} epochs`"></span>
@@ -1575,15 +1600,15 @@
                 </div>
                 <p class="pre-wrap small" x-show="experiment.optimization_reason" x-text="experiment.optimization_reason"></p>
                 <div class="row loose mt">
-                  <code x-text="`训练数据 ${short(experiment.dataset_export_id)}`"></code>
-                  <code x-text="`父实验 ${short(experiment.parent_experiment_id)}`"></code>
+                  <span x-text="entityLabel('export',experiment.dataset_export_id)"></span>
+                  <span x-text="experiment.parent_experiment_id?`父实验：${entityLabel('experiment',experiment.parent_experiment_id)}`:'首轮实验'"></span>
                 </div>
                 <div class="field-inline mt">
                   <label for="evaluation-select">独立评估</label>
                   <select id="evaluation-select" x-model="evaluationId" @change="read(chooseEvaluation(evaluationId))">
                     <option value="">选择已完成报告</option>
                     <template x-for="item in evaluations.filter(x=>x.status==='completed'&&!x.invalidated_reason)" :key="item.id">
-                      <option :value="item.id" :selected="item.id===evaluationId" x-text="`${short(item.id)} · ${time(item.created_at)}`"></option>
+                      <option :value="item.id" :selected="item.id===evaluationId" x-text="entityLabel('evaluation',item.id)"></option>
                     </template>
                   </select>
                 </div>
@@ -1645,12 +1670,14 @@
                   </section>
                   <section class="panel">
                     <div class="panel-head"><h2>混淆矩阵</h2></div>
+                    <button type="button" class="image-open" aria-label="放大查看混淆矩阵" @click="openImage(`/api/v1/evaluations/${evaluationId}/artifacts/validation/confusion_matrix.png`,'混淆矩阵 · 行为预测，列为真值')">
                     <img
                       class="matrix-image"
                       :src="`/api/v1/evaluations/${evaluationId}/artifacts/validation/confusion_matrix.png`"
                       alt="验证集混淆矩阵，行是预测，列是真值"
                       loading="lazy"
                     />
+                    </button>
                   </section>
                 </div>
                 <section class="panel">
@@ -1670,17 +1697,18 @@
                   <div class="error-grid">
                     <template x-for="item in errorImages" :key="item.image_id">
                       <article class="error-card">
-                        <div class="error-image">
-                          <img :src="`/api/v1/evaluations/${evaluationId}/images/${item.image_id}`" :alt="`错误定位 ${item.image_id}`" loading="lazy" />
+                        <button type="button" class="error-image image-open" @click="openErrorImage(item)" aria-label="放大查看错误图片及标注框">
+                          <img :src="`/api/v1/evaluations/${evaluationId}/images/${item.image_id}`" alt="验证集错误定位图片" loading="lazy" x-show="item.imageStatus!=='failed'" @load="item.imageStatus='ready'" @error="item.imageStatus='failed'" />
+                          <span class="error-image-failed" x-show="item.imageStatus==='failed'">图片加载失败，点击重试大图</span>
                           <template x-for="(box,index) in item.ground_truth" :key="`gt-${index}`">
-                            <div class="error-box ground-truth" :class="`is-${box.status}`" :style="errorBoxStyle(box)" aria-hidden="true"></div>
+                            <div class="error-box ground-truth" x-show="item.imageStatus==='ready'" :class="`is-${box.status}`" :style="errorBoxStyle(box)" aria-hidden="true"></div>
                           </template>
                           <template x-for="(box,index) in item.predictions" :key="`pred-${index}`">
-                            <div class="error-box" :class="`is-${box.status}`" :style="errorBoxStyle(box)" aria-hidden="true"></div>
+                            <div class="error-box" x-show="item.imageStatus==='ready'" :class="`is-${box.status}`" :style="errorBoxStyle(box)" aria-hidden="true"></div>
                           </template>
-                        </div>
+                        </button>
                         <div class="image-caption">
-                          <code x-text="short(item.image_id)"></code>
+                          <details class="technical-details"><summary>验证图片编号</summary><code x-text="item.image_id"></code></details>
                           <span class="num" x-text="`TP ${item.counts.tp} · FP ${item.counts.fp} · FN ${item.counts.fn}`"></span>
                         </div>
                         <details>
@@ -1737,10 +1765,11 @@
                   </div>
                   <dl class="facts mt">
                     <div><dt>入口</dt><dd x-text="reusedExport?'已审数据':'原始图片'"></dd></div>
-                    <div><dt>数据版本</dt><dd><code x-text="short(agent.dataset_version_id)"></code></dd></div>
-                    <div><dt>训练数据</dt><dd><code x-text="short(agent?.dataset_export_id)"></code></dd></div>
-                    <div><dt>最佳权重</dt><dd><code x-text="short(agent.best_model_id)"></code></dd></div>
+                    <div><dt>数据版本</dt><dd x-text="entityLabel('version',agent.dataset_version_id)"></dd></div>
+                    <div><dt>训练数据</dt><dd x-text="entityLabel('export',agent?.dataset_export_id)"></dd></div>
+                    <div><dt>最佳权重</dt><dd x-text="entityLabel('model',agent.best_model_id)"></dd></div>
                   </dl>
+                  <details class="technical-details"><summary>内部编号（用于日志追溯）</summary><pre x-text="JSON.stringify({运行:agent.id,数据版本:agent.dataset_version_id,训练数据:agent.dataset_export_id,最佳权重:agent.best_model_id},null,2)"></pre></details>
                   <div class="actions">
                     <a class="button" x-show="agent.report_sha256" :href="`/api/v1/agent-runs/${agentId}/report.md`">下载运行报告 ↓</a>
                     <button class="link" @click="navigate('train')">查看训练 →</button>
@@ -1761,7 +1790,8 @@
                           <strong x-text="phase(event.node)"></strong>
                           <span x-text="eventName(event)"></span>
                         </summary>
-                        <pre x-text="JSON.stringify(event.payload,null,2)"></pre>
+                        <div class="reading-copy"><template x-for="(block,index) in textBlocks(eventDetail(event))" :key="index"><p x-text="block"></p></template><p x-show="!eventDetail(event)">此事件记录了系统阶段或状态变化。</p></div>
+                        <details class="technical-details"><summary>原始事件与技术编号</summary><pre x-text="JSON.stringify(event.payload,null,2)"></pre></details>
                       </details>
                     </template>
                   </div>
@@ -1790,6 +1820,16 @@
         <button type="button" class="icon-button" @click="notice=''" aria-label="关闭状态提示">×</button>
       </div>
 
+      <datalist id="tile-values"><option value="false">关闭</option><option value="true">窗口跟随 imgsz</option><option value="640">640 像素窗口</option><option value="1024">1024 像素窗口</option><option value="1280">1280 像素窗口</option></datalist>
+      <dialog class="image-viewer" x-ref="imageViewer" aria-labelledby="image-viewer-title" @close="viewer=null" @click="if($event.target===$refs.imageViewer)closeImage()">
+        <template x-if="viewer"><div class="viewer-shell">
+          <div class="viewer-toolbar"><div><h2 id="image-viewer-title" x-text="viewer.title"></h2><p class="hint">滚动查看放大区域 · Esc 关闭</p></div><div class="row"><button type="button" class="button small" @click="zoomImage(1/1.5)" aria-label="缩小图片">−</button><span class="num" x-text="`${Math.round(viewer.zoom*100)}%`"></span><button type="button" class="button small" @click="zoomImage(1.5)" aria-label="放大图片">＋</button><button type="button" class="button small" @click="viewer.zoom=1">适应窗口</button><button type="button" class="button small" :disabled="viewer.loading" @click="viewer.zoom=viewer.naturalWidth/viewer.fitWidth">原始尺寸</button><button type="button" class="icon-button" @click="closeImage()" aria-label="关闭图片查看器">×</button></div></div>
+          <div class="viewer-options"><label class="checkbox-field" x-show="viewer.boxes.length"><input type="checkbox" x-model="viewer.showBoxes" /><span>显示标注框与类别</span></label><a class="link" :href="viewer.src" target="_blank" rel="noopener">在新标签页打开原尺寸图片 ↗</a></div>
+          <div class="viewer-viewport" x-ref="viewerViewport"><div class="viewer-canvas"><div class="viewer-image" :style="{width:`${viewer.fitWidth*viewer.zoom}px`}"><img :src="viewer.src" :alt="viewer.title" @load="imageLoaded($event)" @error="viewer.loading=false;viewer.error='图片加载失败，请检查文件是否存在或检查任务是否完成'" /><template x-for="(box,index) in viewer.boxes" :key="index"><div class="viewer-box" x-show="viewer.showBoxes&&!viewer.loading&&!viewer.error" :class="[`is-${box.status}`,{'is-truth':box.truth}]" :style="viewerBoxStyle(box)"><span x-text="box.label"></span></div></template></div></div></div>
+          <p class="viewer-message" role="status" x-show="viewer.loading">正在加载原尺寸图片…</p><p class="viewer-message danger-text" role="alert" x-show="viewer.error" x-text="viewer.error"></p>
+          <details class="viewer-records" x-show="viewer.details"><summary>标注与来源详情</summary><pre x-text="JSON.stringify(viewer.details,null,2)"></pre></details>
+        </div></template>
+      </dialog>
       <dialog class="form-dialog" aria-labelledby="dialog-title" x-ref="dialog" @cancel="if(busy)$event.preventDefault()" @close="modal=null;formError=''">
         <form @submit.prevent="submit()">
           <div class="dialog-head">
@@ -1810,6 +1850,18 @@
             </template>
             <template x-if="['project','dataset'].includes(modal)">
               <label class="field">说明<textarea x-model="form.description" rows="3" maxlength="4000"></textarea></label>
+            </template>
+
+            <template x-if="modal==='copyDataset'">
+              <div class="stack">
+                <p class="hint">复制到当前项目后独立管理，后续修改、追加或删除互不影响。</p>
+                <p class="hint" x-show="!copySources.length">暂无其他项目的数据集。先在其他项目上传数据后即可复制。</p>
+                <label class="field">来源数据集<select x-model="form.source_id" @change="chooseCopySource()" required :disabled="busy"><option value="">请选择其他项目的数据集</option><template x-for="source in copySources" :key="source.id"><option :value="source.id" x-text="copySourceLabel(source)"></option></template></select></label>
+                <label class="field">复制范围<select x-model="form.version_id" :disabled="busy||copyVersionsLoading||!form.source_id"><option value="" x-text="copyVersionsLoading?'正在读取来源版本…':'全部当前原图（不带标注和划分）'"></option><template x-for="version in copyVersions" :key="version.id"><option :value="version.id" x-text="`版本 ${version.number} · ${version.name} · ${version.summary?.image_count??'—'} 张（有标注时一并复制）`"></option></template></select></label>
+                <p class="hint" x-text="form.version_id?'保留该版本的 train / val / test、类别、最新已完成标注及有效审核凭据；未审核部分仍须审核。不会关联来源 CVAT 任务。':'复制提交时的当前原图，包含待处理或异常图片；不复制历史版本、标签或训练记录。'"></p>
+                <label class="field">当前项目中的副本名称<input x-model="form.name" required maxlength="200" autocomplete="off" :disabled="busy" /></label>
+                <p class="hint">后台复制，无需下载再上传。任务完成后在当前数据集查看；训练工件需另行封存。</p>
+              </div>
             </template>
 
             <template x-if="modal==='version'">
@@ -1851,7 +1903,7 @@
                 <label class="field"
                   >已封存图片版本<select x-model="form.version_id" required>
                     <template x-for="item in versions" :key="item.id">
-                      <option :value="item.id" :selected="item.id===form.version_id" x-text="`${item.name} · v${item.number} · ${short(item.id)}`"></option>
+                      <option :value="item.id" :selected="item.id===form.version_id" x-text="`v${item.number} · ${item.name} · ${time(item.created_at)}`"></option>
                     </template>
                   </select></label
                 >
@@ -1869,7 +1921,7 @@
                       <div class="class-source">
                         <select x-model="row.source" :aria-label="`第 ${index+1} 类候选来源`"><option value="yolo26_coco">COCO 预训练</option><option value="grounding_dino">DINO 兜底</option><option value="project_model" :disabled="!sourceModels(row).length">项目 best 模型</option></select>
                         <template x-if="row.source==='yolo26_coco'"><select x-model="row.coco_class" :aria-label="`第 ${index+1} 类 COCO 对应类`"><option value="">选择 COCO 类别</option><template x-for="name in annotationSources?.coco_classes||[]" :key="name"><option :value="name" :selected="name===row.coco_class" x-text="name"></option></template></select></template>
-                        <template x-if="row.source==='project_model'"><select x-model="row.model_id" :aria-label="`第 ${index+1} 类项目模型`"><option value="">选择项目模型</option><template x-for="model in sourceModels(row)" :key="model.model_id"><option :value="model.model_id" :selected="model.model_id===row.model_id" x-text="`${model.base_model} · ${short(model.model_id)}`"></option></template></select></template>
+                        <template x-if="row.source==='project_model'"><select x-model="row.model_id" :aria-label="`第 ${index+1} 类项目模型`"><option value="">选择项目模型</option><template x-for="model in sourceModels(row)" :key="model.model_id"><option :value="model.model_id" :selected="model.model_id===row.model_id" x-text="`${model.base_model} · ${entityLabel('model',model.model_id)}`"></option></template></select></template>
                       </div>
                     </div>
                   </template>
@@ -1907,7 +1959,7 @@
                       >审核期间新增的类别版本（可选）<select x-model="form.reviewed_class_schema_id">
                         <option value="">沿用当前类别版本</option>
                         <template x-for="item in schemas" :key="item.id">
-                          <option :value="item.id" :selected="item.id===form.reviewed_class_schema_id" x-text="`${item.name} · ${short(item.id)}`"></option>
+                          <option :value="item.id" :selected="item.id===form.reviewed_class_schema_id" x-text="`${item.name} · ${item.classes.length} 类 · ${time(item.created_at)}`"></option>
                         </template>
                       </select></label
                     >
@@ -1922,7 +1974,7 @@
                   >已审训练数据<select x-model="form.dataset_export_id" required>
                     <option value="">请选择</option>
                     <template x-for="item in exports" :key="item.id">
-                      <option :value="item.id" :selected="item.id===form.dataset_export_id" x-text="`${short(item.id)} · ${time(item.created_at)}`"></option>
+                      <option :value="item.id" :selected="item.id===form.dataset_export_id" x-text="`${entityLabel('export',item.id)} · ${time(item.created_at)}`"></option>
                     </template>
                   </select></label
                 >
@@ -1961,6 +2013,7 @@
                             </select>
                           </template>
                           <template x-if="field.control==='layers'"><input x-model="form.parameters[field.name]" placeholder="0 或 [0,1,2]" /></template>
+                          <template x-if="field.control==='tile'"><input x-model="form.parameters[field.name]" list="tile-values" placeholder="false / true / 正整数像素" /></template>
                           <template x-if="field.control==='number'&&!parameterIsSelect(field,false)">
                             <input type="number" :min="field.minimum??field.exclusiveMinimum" :max="field.maximum??field.exclusiveMaximum" :step="field.type==='integer'?1:'any'" x-model="form.parameters[field.name]" />
                           </template>
@@ -2018,6 +2071,7 @@
               </div>
             </template>
 
+            <template x-if="modal==='deleteAsset'"><div class="stack"><div class="alert warning"><strong x-text="form.kind==='dataset'?'确认删除这个数据集？':'确认删除这张已上传图片？'"></strong><p x-text="form.name"></p></div><p class="hint">删除后从工作区列表移除，不再参与新的分析或数据划分。已封存版本、历史标注和模型依赖的文件保留用于追溯，不会随此操作销毁。存在活跃上传、计算或 Agent 流程时禁止删除。</p><label class="field">输入名称确认<input x-model="form.confirm" :placeholder="form.name" autocomplete="off" required /></label></div></template>
             <template x-if="modal==='annotationImage'&&annotationImage">
               <div class="stack">
                 <div class="annotation-preview">
@@ -2041,10 +2095,10 @@
             <button
               type="submit"
               class="button"
-              :class="modal==='publish'?'danger-solid':'primary'"
+              :class="['publish','deleteAsset'].includes(modal)?'danger-solid':'primary'"
               x-show="modal!=='annotationImage'"
-              :disabled="busy"
-              x-text="busy?'正在提交…':({publish:'按人工确认发布',sync:'确认并提交回传',resumeAgent:'提交并继续'}[modal]||'提交')"
+              :disabled="busy||(modal==='deleteAsset'&&form.confirm!==form.name)||(modal==='copyDataset'&&(!form.source_id||copyVersionsLoading))"
+              x-text="busy?'正在提交…':({copyDataset:'创建独立副本',publish:'按人工确认发布',deleteAsset:'确认删除',sync:'确认并提交回传',resumeAgent:'提交并继续'}[modal]||'提交')"
             ></button>
           </div>
         </form>
