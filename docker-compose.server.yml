@@ -1,0 +1,84 @@
+services:
+  api:
+    image: yolo26-agent-lab-api:0.1.0
+    build:
+      context: .
+      args:
+        TORCH_FLAVOR: cpu
+    command: ["sh", "-c", "yolo-agent init-db && exec yolo-agent api"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      YOLO_API_HOST: 0.0.0.0
+      YOLO_DEVICE: cpu
+      YOLO_REDIS_URL: redis://redis:6379/0
+      YOLO_MLFLOW_TRACKING_URI: http://mlflow:5000
+      YOLO_MLFLOW_PUBLIC_URL: ${YOLO_MLFLOW_PUBLIC_URL:-http://localhost:5001}
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./storage:/app/storage
+      - ./docs/reports:/app/docs/reports
+    depends_on:
+      redis:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health/ready', timeout=10)"]
+      interval: 15s
+      timeout: 12s
+      retries: 5
+    restart: unless-stopped
+  worker:
+    image: yolo26-agent-lab-worker:cpu-0.1.0
+    build:
+      context: .
+      args:
+        TORCH_FLAVOR: cpu
+    command: ["yolo-agent", "worker"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      YOLO_DEVICE: ${YOLO_DEVICE:-auto}
+      YOLO_REDIS_URL: redis://redis:6379/0
+      YOLO_MLFLOW_TRACKING_URI: http://mlflow:5000
+      YOLO_CVAT_URL: ${YOLO_CONTAINER_CVAT_URL:-http://cvat_server:8080}
+      YOLO_CVAT_PUBLIC_URL: ${YOLO_CVAT_PUBLIC_URL:-http://localhost:8080}
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    volumes:
+      - ./storage:/app/storage
+    depends_on:
+      api:
+        condition: service_healthy
+    stop_grace_period: 30s
+    restart: unless-stopped
+  agent-controller:
+    image: yolo26-agent-lab-api:0.1.0
+    build:
+      context: .
+      args:
+        TORCH_FLAVOR: cpu
+    command: ["yolo-agent", "agent-controller"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      YOLO_DEVICE: cpu
+      YOLO_REDIS_URL: redis://redis:6379/0
+      YOLO_MLFLOW_TRACKING_URI: http://mlflow:5000
+      YOLO_CVAT_URL: ${YOLO_CONTAINER_CVAT_URL:-http://cvat_server:8080}
+      YOLO_CVAT_PUBLIC_URL: ${YOLO_CVAT_PUBLIC_URL:-http://localhost:8080}
+    volumes:
+      - ./storage:/app/storage
+      - ./docs/reports:/app/docs/reports
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    depends_on:
+      api:
+        condition: service_healthy
+    stop_grace_period: 190s
+    restart: unless-stopped

@@ -1,0 +1,6 @@
+search_space:
+  imgsz: [320, 640, 960, 1280]
+  lr0: {low: 0.0001, high: 0.01, log: true}
+  weight_decay: {low: 0.00001, high: 0.001, log: true}
+  mosaic: [0.0, 0.5, 1.0]
+  optimizer: [auto, SGD, MuSGD, Adam, AdamW, Adamax, NAdam, RAdam, RMSprop]

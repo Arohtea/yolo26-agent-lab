@@ -1,0 +1,10 @@
+agent_policy:
+  max_experiments: 20
+  max_training_hours: 48
+  max_retries: 2
+  max_gpu_memory_ratio: 0.90
+  stagnation_rounds: 8
+  minimum_improvement: 0.001
+  allowed_models: [yolo26n.pt, yolo26s.pt]
+  allowed_operations: [analyze_dataset, auto_annotate, create_experiment, train, validate, compare, optimize, export_model]
+  require_approval: [change_class_schema, delete_dataset, publish_model, modify_model_architecture]

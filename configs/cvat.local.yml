@@ -1,0 +1,28 @@
+services:
+  cvat_server:
+    # WARN：上游此版本只提供 amd64，Apple Silicon 由 Docker 执行指令集转换。
+    platform: linux/amd64
+    environment:
+      NUMPROCS: 1
+    labels:
+      traefik.http.routers.cvat.rule: >-
+        (Host(`localhost`) || Host(`127.0.0.1`)) &&
+        (PathPrefix(`/api/`) || PathPrefix(`/static/`) || PathPrefix(`/admin`) || PathPrefix(`/django-rq`))
+  cvat_worker_import:
+    platform: linux/amd64
+    environment:
+      NUMPROCS: 1
+  cvat_worker_export:
+    platform: linux/amd64
+    environment:
+      NUMPROCS: 1
+  cvat_ui:
+    platform: linux/amd64
+    labels:
+      traefik.http.routers.cvat-ui.rule: Host(`localhost`) || Host(`127.0.0.1`)
+      traefik.http.routers.cvat-ui.middlewares: lab-review-frame
+      traefik.http.middlewares.lab-review-frame.headers.customresponseheaders.X-Frame-Options: ""
+      traefik.http.middlewares.lab-review-frame.headers.contentsecuritypolicy: "frame-ancestors 'self' http://localhost:8000 http://127.0.0.1:8000"
+  traefik:
+    ports: !override
+      - "127.0.0.1:8080:8080"

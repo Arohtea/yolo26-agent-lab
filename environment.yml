@@ -1,0 +1,6 @@
+name: yolo26-agent-lab
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+  - pip

@@ -1,0 +1,2054 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="theme-color" content="#F6F8FC" />
+    <meta name="description" content="YOLO26 自主训练工作台：上传原图与需求、自动标注、人工审核、Agent 训练与模型导出。" />
+    <title>YOLO26 Lab</title>
+    <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg" />
+    <link rel="preload" href="/assets/vendor/inter.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="stylesheet" href="/assets/app.css" />
+    <script defer src="/assets/vendor/chart.min.js?v=4.5.1"></script>
+    <script defer src="/assets/app.js"></script>
+    <script defer src="/assets/vendor/alpine.min.js?v=3.15.8"></script>
+  </head>
+  <body>
+    <div id="boot" class="boot">
+      <span class="brand-mark large det" aria-hidden="true">Y</span>
+      <p>正在连接 YOLO26 Lab…</p>
+      <a href="/api/v1/health/ready">查看服务状态</a>
+    </div>
+    <noscript>此管理界面需要启用 JavaScript。接口与运行记录仍可通过 <a href="/docs">API 文档</a>访问。</noscript>
+    <div class="app-shell" x-data="lab" x-cloak>
+      <a class="skip-link" href="#main" @click.prevent="focusContent()">跳到主要内容</a>
+      <header class="app-header">
+        <div class="global-bar">
+          <a class="brand" href="#projects" @click="if(busy||modal!==null)$event.preventDefault()" aria-label="YOLO26 Lab 项目列表">
+            <span class="brand-mark det" aria-hidden="true">Y</span>
+            <span class="brand-text"><strong>YOLO26 Lab</strong></span>
+          </a>
+          <nav class="global-nav" aria-label="全局导航">
+            <template x-for="item in globalNav" :key="item.id">
+              <a class="global-nav-item" :href="routeHref(item.id)" :class="{'selected':page===item.id||(item.id==='projects'&&isProjectView)}" :aria-current="page===item.id?'page':null" @click="if(busy||modal!==null)$event.preventDefault()">
+                <span aria-hidden="true" x-text="item.icon"></span><span x-text="item.name"></span>
+              </a>
+            </template>
+          </nav>
+          <div class="global-tools">
+            <span class="status-chip compute-status" :class="worker?'ok':'warn'" :title="worker?.selection_reason||'等待 Worker 环境报告'">
+              <span class="dot" aria-hidden="true"></span><span x-text="worker?worker.effective_device.toUpperCase():'等待节点'"></span>
+              <span class="node-spec" x-show="worker" x-text="worker?`${worker.os} · ${worker.cpu_count??'—'} 核 · ${bytes(worker.memory_total_bytes)}`:''"></span>
+            </span>
+            <a class="utility-link" href="/docs" target="_blank" rel="noopener">API <span aria-hidden="true">↗</span></a>
+            <a class="utility-link utility-guide" href="/guide/README" target="_blank" rel="noopener">使用说明 <span aria-hidden="true">↗</span></a>
+            <button type="button" class="button quiet small refresh-button" @click="refresh(true)" :disabled="loading" :title="lastUpdated?`更新于 ${time(lastUpdated)}`:'刷新数据'" aria-label="刷新当前页面"><span aria-hidden="true">↻</span><span class="refresh-label">刷新</span></button>
+          </div>
+        </div>
+        <template x-if="isProjectView&&currentProject">
+          <div class="project-bar">
+            <div class="project-context">
+              <span class="project-glyph" aria-hidden="true">◫</span>
+              <label class="sr-only" for="project-select">切换当前项目</label>
+              <select id="project-select" :value="projectId" @change="openProject($event.target.value,page)" :disabled="busy||loading||refreshing||modal!==null">
+                <template x-for="project in projects" :key="project.id"><option :value="project.id" :selected="project.id===projectId" x-text="project.name"></option></template>
+              </select>
+            </div>
+            <span class="project-scope">项目空间</span>
+            <nav class="project-tabs" aria-label="当前项目导航">
+              <template x-for="item in projectNav" :key="item.id">
+                <a class="project-tab" :href="routeHref(item.id)" :class="{'selected':page===item.id}" :aria-current="page===item.id?'page':null" @click="if(busy||modal!==null)$event.preventDefault()">
+                  <span class="nav-step" x-show="item.step" :class="item.step?`is-${stepState(item.step)}`:''" x-text="item.step&&stepState(item.step)==='done'?'✓':item.step"></span>
+                  <span class="nav-icon" x-show="!item.step" aria-hidden="true" x-text="item.icon"></span>
+                  <span x-text="item.name"></span>
+                  <span class="nav-flag" x-show="item.step&&stepState(item.step)==='gate'" title="等你处理"></span>
+                </a>
+              </template>
+            </nav>
+          </div>
+        </template>
+      </header>
+
+      <div class="workspace">
+        <main id="main" tabindex="-1">
+          <div class="alert warning" role="status" x-show="routeNotice"><p x-text="routeNotice"></p><button class="link" type="button" @click="routeNotice=''">收起</button></div>
+          <div class="alert danger" role="alert" x-show="error">
+            <strong>操作或刷新未完成</strong>
+            <p x-text="error"></p>
+            <p x-show="lastUpdated">页面仍显示上一次成功读取的数据。</p>
+            <button class="link" type="button" @click="error=''">收起</button>
+          </div>
+
+          <template x-if="initialized&&!projects.length&&page==='projects'">
+            <section class="panel empty welcome">
+              <span class="brand-mark large det" aria-hidden="true">Y</span>
+              <h2>建立第一个训练项目</h2>
+              <p>上传原图并写下需求，系统自动标注，你审核后 Agent 负责训练与导出。</p>
+              <button class="button primary" @click="show('project')">创建项目</button>
+            </section>
+          </template>
+
+          <header class="page-head" x-show="initialized">
+            <div class="page-title">
+              <span class="eyebrow" x-text="pageEyebrow"></span>
+              <h1 x-text="pageTitle"></h1>
+              <p class="page-sub" x-show="pageSub" x-text="pageSub"></p>
+            </div>
+            <div class="page-tools" x-show="flowPage&&agents.length">
+              <label for="flow-select">当前流程</label>
+              <select id="flow-select" x-model="agentId" @change="read(chooseAgent(agentId))">
+                <template x-for="item in agents" :key="item.id">
+                  <option :value="item.id" :selected="item.id===agentId" x-text="`${item.name} · ${status(item.status)}`"></option>
+                </template>
+              </select>
+            </div>
+          </header>
+
+          <nav class="flow-strip" aria-label="主流程进度" x-show="flowPage&&projectId">
+            <template x-for="(step,index) in steps" :key="step.id">
+              <a class="flow-step" :href="routeHref(step.id)" :class="stepClass(index+1,step.id)" :aria-current="page===step.id?'page':null">
+                <span class="det-tag" x-show="['current','gate'].includes(stepState(index+1))" x-text="stepState(index+1)==='gate'?'等你处理':'当前'"></span>
+                <span class="step-marker" aria-hidden="true" x-text="stepState(index+1)==='done'?'✓':index+1"></span>
+                <span class="step-text">
+                  <strong x-text="step.name"></strong>
+                  <small x-text="stepText(index+1)"></small>
+                </span>
+              </a>
+            </template>
+          </nav>
+
+          <!-- 全局总览只汇总所有项目的真实记录，不复用当前项目数据。 -->
+          <section class="view" x-show="page==='overview'" aria-label="所有项目总览">
+            <div class="kpis">
+              <article class="kpi">
+                <span class="kpi-label">项目总数</span>
+                <p class="kpi-line"><strong class="kpi-value num" x-text="globalOverview?.counts?.projects??'—'"></strong><span class="kpi-unit">个</span></p>
+                <a class="link" href="#projects">查看项目列表 →</a>
+              </article>
+              <article class="kpi">
+                <span class="kpi-label">原始图片</span>
+                <p class="kpi-line"><strong class="kpi-value num" x-text="globalOverview?.counts?.images??'—'"></strong><span class="kpi-unit">张</span></p>
+                <p class="kpi-note" x-text="`已审数据 ${globalOverview?.counts?.reviewed_exports??'—'} 份`"></p>
+              </article>
+              <article class="kpi">
+                <span class="kpi-label">已完成实验</span>
+                <p class="kpi-line"><strong class="kpi-value num" x-text="globalOverview?.counts?.completed_experiments??'—'"></strong><span class="kpi-unit">次</span></p>
+                <p class="kpi-note" x-text="`实验总数 ${globalOverview?.counts?.experiments??'—'}`"></p>
+              </article>
+              <article class="kpi">
+                <span class="kpi-label">活跃流程</span>
+                <p class="kpi-line"><strong class="kpi-value num" x-text="globalOverview?.counts?.active_agent_runs??'—'"></strong><span class="kpi-unit">个</span></p>
+                <p class="kpi-note" x-text="`待处理标注 ${globalOverview?.counts?.pending_annotation_runs??'—'} 次`"></p>
+              </article>
+            </div>
+            <div class="grid-main">
+              <section class="panel">
+                <div class="panel-head"><h2>最近流程</h2><span class="meta">所有项目 · 最近 12 条</span></div>
+                <div class="table-scroll" x-show="globalRuns.length">
+                  <table>
+                    <thead><tr><th>项目 / 流程</th><th>状态</th><th>创建时间</th><th><span class="sr-only">操作</span></th></tr></thead>
+                    <tbody><template x-for="run in globalRuns" :key="run.id"><tr>
+                      <td><strong x-text="projectName(run.project_id)"></strong><div class="meta" x-text="run.name"></div></td>
+                      <td><span class="badge" :class="tone(run.status)" x-text="status(run.status)"></span></td>
+                      <td class="meta" x-text="time(run.created_at)"></td>
+                      <td><a class="link" :href="routeHref('agents',run.project_id)">进入项目 →</a></td>
+                    </tr></template></tbody>
+                  </table>
+                </div>
+                <div class="empty compact" x-show="!globalRuns.length"><p>还没有流程记录。进入项目后可开始数据准备与训练。</p><a class="link" href="#projects">选择项目 →</a></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><h2>计算环境</h2><span class="badge" :class="readiness?.status==='ready'?'success':'warning'" x-text="readiness?.status==='ready'?'服务就绪':'等待服务就绪'"></span></div>
+                <dl class="review-facts">
+                  <div><dt>Worker 设备</dt><dd x-text="worker?.effective_device?.toUpperCase()||'暂无报告'"></dd></div>
+                  <div><dt>系统 / 架构</dt><dd x-text="worker?`${worker.os} / ${worker.architecture}`:'—'"></dd></div>
+                  <div><dt>CPU / 内存</dt><dd x-text="worker?`${worker.cpu_count??'—'} 核 / ${bytes(worker.memory_total_bytes)}`:'—'"></dd></div>
+                  <div><dt>PyTorch</dt><dd x-text="worker?.torch_version||'—'"></dd></div>
+                  <div><dt>报告时间</dt><dd x-text="time(worker?.collected_at)"></dd></div>
+                </dl>
+                <p class="hint" x-text="worker?.selection_reason||'等待 Worker 上报实际运行环境'"></p>
+                <div class="actions"><a class="link" href="/api/v1/system/runtime" target="_blank" rel="noopener">完整环境报告 ↗</a><a class="link" href="/docs" target="_blank" rel="noopener">API 文档 ↗</a></div>
+              </section>
+            </div>
+          </section>
+
+          <!-- 项目概览 -->
+          <section class="view" x-show="page==='dashboard'&&projectId" aria-label="工作台概览">
+            <div class="kpis">
+              <article class="kpi">
+                <span class="kpi-label">当前流程</span>
+                <p class="kpi-line">
+                  <strong class="kpi-value" x-text="agent?`第 ${flowStep} 步`:'—'"></strong><span class="kpi-unit" x-show="agent">/ 5</span>
+                </p>
+                <p class="kpi-note" x-text="agent?agentStateText:'从「上传与需求」开始'"></p>
+                <div class="bar" aria-hidden="true"><span :style="`width:${agent?flowStep*20:0}%`"></span></div>
+              </article>
+              <article class="kpi">
+                <span class="kpi-label">最佳验证 mAP50–95</span>
+                <p class="kpi-line"><strong class="kpi-value num" x-text="metric(flowBest?.map50_95,3)"></strong></p>
+                <p class="kpi-note" x-text="flowBest?`第 ${flowBest.iteration+1} 轮 · 已完成 ${agentIterations.length} 轮`:'首轮评估完成后显示'"></p>
+              </article>
+              <article class="kpi" :class="{'attention':(overview?.counts?.corrupt_images||0)>0}">
+                <span class="kpi-label">原始图片</span>
+                <p class="kpi-line">
+                  <strong class="kpi-value num" x-text="overview?.counts?.images??'—'"></strong><span class="kpi-unit">张</span>
+                </p>
+                <p class="kpi-note" x-text="`损坏 ${overview?.counts?.corrupt_images??0} · 已审数据 ${overview?.counts?.reviewed_exports??0} 份`"></p>
+              </article>
+              <article class="kpi">
+                <span class="kpi-label">训练用时</span>
+                <p class="kpi-line">
+                  <strong class="kpi-value num" x-text="agentBudget?metric(agentBudget.training_seconds/3600,2):'—'"></strong
+                  ><span class="kpi-unit" x-show="agent" x-text="`/ ${agent?.policy?.max_training_hours} 小时`"></span>
+                </p>
+                <p class="kpi-note" x-text="agentBudget?`实验 ${agentBudget.experiments} / ${agentBudget.max_experiments}`:'开始训练后统计'"></p>
+                <div class="bar" aria-hidden="true">
+                  <span :style="`width:${agentBudget?Math.min(100,(agentBudget.training_seconds/agentBudget.max_training_seconds)*100):0}%`"></span>
+                </div>
+              </article>
+            </div>
+
+            <div class="grid-main">
+              <section class="panel">
+                <div class="panel-head">
+                  <div>
+                    <h2>训练曲线</h2>
+                    <p class="meta" x-text="experiment?experiment.name:'还没有训练记录'"></p>
+                  </div>
+                  <select aria-label="选择曲线实验" x-show="experiments.length" x-model="experimentId" @change="read(chooseExperiment(experimentId))">
+                    <template x-for="item in experiments" :key="item.id">
+                      <option :value="item.id" :selected="item.id===experimentId" x-text="item.name"></option>
+                    </template>
+                  </select>
+                </div>
+                <div class="chart-pair" x-show="epochs.length">
+                  <div>
+                    <h3>Loss</h3>
+                    <div class="chart-wrap"><canvas id="dashboard-loss" role="img" aria-label="逐 epoch 训练 Loss 曲线"></canvas></div>
+                  </div>
+                  <div>
+                    <h3>验证 mAP50–95</h3>
+                    <div class="chart-wrap"><canvas id="dashboard-map" role="img" aria-label="逐 epoch 验证集 mAP50–95 曲线"></canvas></div>
+                  </div>
+                </div>
+                <div class="empty compact" x-show="!epochs.length">
+                  <p>开始训练后，曲线随每个 epoch 更新。</p>
+                </div>
+                <div class="actions">
+                  <button class="link" @click="navigate('train')">训练详情 →</button>
+                  <a class="link" :href="url(overview?.configuration?.mlflow_url)" target="_blank" rel="noopener noreferrer">打开 MLflow ↗</a>
+                </div>
+              </section>
+
+              <section class="panel">
+                <div class="panel-head">
+                  <h2>待处理</h2>
+                  <span class="badge" :class="pendingActions.length?'warning':'success'" x-text="pendingActions.length?`${pendingActions.length} 项`:'无'"></span>
+                </div>
+                <div class="todo-list">
+                  <template x-for="item in pendingActions" :key="`${item.run.id}-${item.title}`">
+                    <button type="button" class="todo" :class="`is-${item.tone}`" @click="agentId=item.run.id;navigate(item.page)">
+                      <strong x-text="item.title"></strong>
+                      <span x-text="item.run.name"></span>
+                      <small x-show="item.detail" x-text="item.detail"></small>
+                    </button>
+                  </template>
+                  <p class="hint" x-show="!pendingActions.length">没有需要你处理的事项。</p>
+                </div>
+              </section>
+            </div>
+
+            <div class="grid-main">
+              <section class="panel">
+                <div class="panel-head">
+                  <h2>最近活动</h2>
+                  <button class="link" @click="navigate('agents')" x-show="agent">全部记录 →</button>
+                </div>
+                <ol class="activity compact">
+                  <template x-for="item in timeline.slice(0,8)" :key="item.id">
+                    <li class="act" :class="`is-${item.tone}`">
+                      <time x-text="clock(item.time)"></time>
+                      <div>
+                        <strong x-text="item.title"></strong>
+                        <p x-show="item.detail" x-text="item.detail"></p>
+                      </div>
+                    </li>
+                  </template>
+                </ol>
+                <p class="hint" x-show="!timeline.length">流程开始后，这里显示 Agent 的动作与结果。</p>
+              </section>
+
+              <section class="panel">
+                <div class="panel-head">
+                  <h2>计算节点</h2>
+                  <span class="badge plain" x-text="worker?.os||'暂无报告'"></span>
+                </div>
+                <p class="device" x-text="worker?.effective_device?.toUpperCase()||'等待节点报告'"></p>
+                <p class="hint" x-text="worker?.selection_reason||'Worker 上线并报告后显示实际设备。'"></p>
+                <dl class="facts">
+                  <div><dt>内存</dt><dd x-text="bytes(worker?.memory_total_bytes)"></dd></div>
+                  <div><dt>CPU 核心</dt><dd x-text="worker?.cpu_count??'—'"></dd></div>
+                  <div><dt>PyTorch</dt><dd x-text="worker?.torch_version??'—'"></dd></div>
+                  <div><dt>CUDA runtime</dt><dd x-text="worker?.cuda_runtime_version??'不可用'"></dd></div>
+                </dl>
+                <template x-for="gpu in worker?.gpus||[]" :key="gpu.logical_index">
+                  <div class="gpu-row">
+                    <div class="row spread">
+                      <strong x-text="gpu.name"></strong>
+                      <span class="num" x-text="`${bytes(gpu.memory_used_bytes)} / ${bytes(gpu.memory_total_bytes)}`"></span>
+                    </div>
+                    <progress x-show="gpu.memory_used_bytes!=null" :value="gpu.memory_used_bytes" :max="gpu.memory_total_bytes" aria-label="实际显存使用量"></progress>
+                  </div>
+                </template>
+                <p class="hint mt">报告时间 <time x-text="time(worker?.collected_at)"></time></p>
+              </section>
+            </div>
+          </section>
+
+          <!-- 1 上传与需求 -->
+          <section class="view" x-show="page==='upload'&&projectId" aria-label="上传原图与需求">
+            <div class="grid-main">
+              <section class="panel">
+                <div class="panel-head">
+                  <div>
+                    <h2>数据集</h2>
+                    <p class="meta" x-text="currentDataset?currentDataset.name:'先建立一个数据集'"></p>
+                  </div>
+                  <div class="row">
+                    <select aria-label="选择数据集" x-show="datasets.length" x-model="datasetId" :disabled="busy" @change="read(chooseDataset(datasetId))">
+                      <template x-for="item in datasets" :key="item.id">
+                        <option :value="item.id" :selected="item.id===datasetId" x-text="item.name"></option>
+                      </template>
+                    </select>
+                    <button class="button" :disabled="busy" @click="show('dataset')">＋ 新建数据集</button>
+                  </div>
+                </div>
+                <div class="empty" x-show="!datasets.length">
+                  <h3>先建立数据集</h3>
+                  <p>数据集用来归档同一批原图，之后的划分和标注都以它为准。</p>
+                  <button class="button primary" @click="show('dataset')">新建数据集</button>
+                </div>
+                <template x-if="datasetId">
+                  <div class="stack">
+                    <div class="upload-choices" role="group" aria-label="选择上传内容">
+                      <button class="button" :class="{'primary':uploadMode==='images'}" :aria-pressed="uploadMode==='images'" :disabled="busy" @click="uploadMode='images'">原始图片</button>
+                      <button class="button" :class="{'primary':uploadMode==='labeled'}" :aria-pressed="uploadMode==='labeled'" :disabled="busy" @click="uploadMode='labeled'">已标注数据集</button>
+                    </div>
+                    <div class="stack" x-show="uploadMode==='images'">
+                    <label class="upload-zone" :class="{'has-files':uploadCount}">
+                      <span class="upload-icon" aria-hidden="true">⇪</span>
+                      <strong x-text="uploadCount?`已选择 ${uploadCount} 张图片`:'点击选择或拖入图片'"></strong>
+                      <span
+                        x-text="`JPG / PNG / WEBP · 单批最多 ${limits.files??'—'} 张 · 文件大小不限`"
+                      ></span>
+                      <input type="file" x-ref="uploadFiles" accept=".jpg,.jpeg,.png,.webp" multiple @change="uploadCount=$event.target.files.length" />
+                    </label>
+                    <details>
+                      <summary>按视频、场景或采集批次分组（可选）</summary>
+                      <p class="hint">
+                        同组图片会划入同一子集，避免相邻帧同时出现在训练集和验证集。按文件名填写 JSON，字段为 video_id、scene_id 或 batch_id，
+                        例如 <code>{"img_001.jpg": {"video_id": "cam1"}}</code>。
+                      </p>
+                      <textarea class="mono mt" aria-label="逐图分组元数据" x-model="uploadMeta" rows="4" spellcheck="false"></textarea>
+                    </details>
+                    <div class="row spread">
+                      <span class="hint" x-text="images.length?`本页 ${images.length} 张，导入后自动检查损坏与重复`:'还没有图片'"></span>
+                      <button class="button primary" @click="uploadImages()" :disabled="busy||!uploadCount">上传图片</button>
+                    </div>
+                    </div>
+                    <div class="stack" x-show="uploadMode==='labeled'">
+                      <p class="hint">上传 YOLO 检测数据，保留原有 train / val / test。支持 train/images 与 images/train 布局，负样本需有空 TXT 标签。</p>
+                      <div class="labeled-pickers">
+                        <label class="upload-zone" :class="{'has-files':labeledUpload.count}">
+                          <span class="upload-icon" aria-hidden="true">⇪</span>
+                          <strong>选择数据集文件夹</strong>
+                          <span>包含 data.yaml、图片和 labels</span>
+                          <input type="file" x-ref="labeledFolder" webkitdirectory multiple :disabled="busy" aria-label="选择已标注数据集文件夹" @change="selectLabeledFiles($event.target.files)" />
+                        </label>
+                        <label class="upload-zone">
+                          <span class="upload-icon" aria-hidden="true">▤</span>
+                          <strong>选择 ZIP 压缩包</strong>
+                          <span>文件大小不限</span>
+                          <input type="file" x-ref="labeledArchive" accept=".zip" :disabled="busy" aria-label="选择已标注数据集 ZIP" @change="selectLabeledFiles($event.target.files)" />
+                        </label>
+                      </div>
+                      <p class="hint" role="status" x-show="labeledUpload.count"><strong x-text="labeledUpload.name"></strong> · <span x-text="`${labeledUpload.count} 个文件 · ${bytes(labeledUpload.bytes)}`"></span></p>
+                      <label class="checkbox-field"><input type="checkbox" x-model="labeledUpload.reviewed" :disabled="busy" /><span>此数据已在外部完成逐图审核和漏标检查，继承已有审核结果</span></label>
+                      <div class="stack" x-show="labeledUpload.reviewed">
+                        <label class="field">外部审核者<input x-model="labeledUpload.reviewer" maxlength="200" :disabled="busy" autocomplete="off" /></label>
+                        <label class="field">审核来源说明<textarea x-model="labeledUpload.confirmation" maxlength="4000" rows="2" :disabled="busy" placeholder="说明谁在何处完成审核及漏标检查"></textarea></label>
+                      </div>
+                      <p class="hint">默认作为待审核标注导入。越界框会裁剪并记录，受影响图片须重新审核。</p>
+                      <div x-show="labeledUpload.progress!==null" role="status" aria-live="polite">
+                        <progress :value="labeledUpload.progress??0" max="100" aria-label="已标注数据集上传进度"></progress>
+                        <p class="hint" x-text="labeledUpload.progress===100?'上传完成，正在接收文件并登记后台任务…':`正在上传 ${labeledUpload.progress??0}%`"></p>
+                      </div>
+                      <button class="button primary" @click="uploadLabeledDataset()" :disabled="busy||!labeledUpload.count" x-text="labeledUpload.progress!==null?'正在上传…':'上传已标注数据集'"></button>
+                    </div>
+                    <div class="alert danger" role="alert" x-show="inlineError"><p x-text="inlineError"></p></div>
+                    <div class="image-grid" x-show="images.length">
+                      <template x-for="image in images" :key="image.id">
+                        <article class="image-card">
+                          <img
+                            x-show="image.status==='valid'"
+                            :src="image.status==='valid'?`/api/v1/images/${image.id}/preview`:''"
+                            :alt="image.original_name"
+                            loading="lazy"
+                          />
+                          <div class="image-unavailable" x-show="image.status!=='valid'">无法预览</div>
+                          <div class="image-caption">
+                            <strong x-text="image.original_name" :title="image.original_name"></strong>
+                            <div class="row">
+                              <span class="badge" :class="tone(image.status)" x-text="status(image.status)"></span>
+                              <small class="num" x-text="image.width?`${image.width}×${image.height}`:image.error||'等待检查'"></small>
+                            </div>
+                          </div>
+                        </article>
+                      </template>
+                    </div>
+                    <div class="pagination" x-show="imageOffset>0||imagesMore">
+                      <button class="button quiet small" @click="imageOffset-=24;read(chooseDataset(datasetId,false))" :disabled="imageOffset===0">← 上一页</button>
+                      <span class="meta" x-text="`第 ${Math.floor(imageOffset/24)+1} 页`"></span>
+                      <button class="button quiet small" @click="imageOffset+=24;read(chooseDataset(datasetId,false))" :disabled="!imagesMore">下一页 →</button>
+                    </div>
+                  </div>
+                </template>
+              </section>
+
+              <section class="panel requirement-panel" x-show="uploadMode==='images'">
+                <div class="panel-head">
+                  <div>
+                    <h2>需求说明</h2>
+                    <p class="meta">要检测什么、更在意漏检还是误检、部署到哪里</p>
+                  </div>
+                </div>
+                <label class="field"
+                  ><span class="sr-only">检测需求</span
+                  ><textarea
+                    x-model="pipeline.requirement"
+                    rows="5"
+                    maxlength="2000"
+                    placeholder="例：检测钢板表面的划痕、凹坑和锈斑。宁可误检也不要漏检，模型要部署到边缘盒子。"
+                  ></textarea>
+                </label>
+                <div class="row">
+                  <button
+                    class="button"
+                    @click="draftClasses()"
+                    :disabled="busy||pipeline.drafting||pipeline.requirement.trim().length<4||!llmReady"
+                    x-text="pipeline.drafting?'正在生成…':'根据需求生成类别'"
+                  ></button>
+                  <select aria-label="使用已有类别版本" x-show="schemas.length" x-model="pipeline.schemaId" @change="useSchema()">
+                    <option value="">或用已有类别版本</option>
+                    <template x-for="item in schemas" :key="item.id">
+                      <option :value="item.id" :selected="item.id===pipeline.schemaId" x-text="`${item.name} · ${item.classes.length} 类`"></option>
+                    </template>
+                  </select>
+                </div>
+
+                <div class="class-editor source-editor">
+                  <div class="class-head" aria-hidden="true"><span>#</span><span>类别名称</span><span>DINO 英文提示词</span><span>候选来源</span><span></span></div>
+                  <template x-for="(row,index) in pipeline.classes" :key="index">
+                    <div class="class-row">
+                      <code x-text="index"></code>
+                      <input :aria-label="`第 ${index+1} 类名称`" x-model="row.name" maxlength="100" :readonly="!!pipeline.schemaId" />
+                      <input
+                        class="mono"
+                        :aria-label="`第 ${index+1} 类英文提示词`"
+                        x-model="row.prompt"
+                        maxlength="80"
+                        placeholder="scratch on metal"
+                        :readonly="!!pipeline.schemaId"
+                      />
+                      <div class="class-source">
+                        <select x-model="row.source" :aria-label="`第 ${index+1} 类候选来源`">
+                          <option value="yolo26_coco">COCO 预训练</option>
+                          <option value="grounding_dino">DINO 兜底</option>
+                          <option value="project_model" :disabled="!sourceModels(row).length">项目 best 模型</option>
+                        </select>
+                        <template x-if="row.source==='yolo26_coco'">
+                          <select x-model="row.coco_class" :aria-label="`第 ${index+1} 类 COCO 对应类`">
+                            <option value="">选择 COCO 类别</option>
+                            <template x-for="name in annotationSources?.coco_classes||[]" :key="name"><option :value="name" :selected="name===row.coco_class" x-text="name"></option></template>
+                          </select>
+                        </template>
+                        <template x-if="row.source==='project_model'">
+                          <select x-model="row.model_id" :aria-label="`第 ${index+1} 类项目模型`">
+                            <option value="">选择项目模型</option>
+                            <template x-for="model in sourceModels(row)" :key="model.model_id"><option :value="model.model_id" :selected="model.model_id===row.model_id" x-text="`${model.base_model} · ${short(model.model_id)}`"></option></template>
+                          </select>
+                        </template>
+                      </div>
+                      <button
+                        type="button"
+                        class="icon-button"
+                        @click="pipeline.classes.splice(index,1)"
+                        :disabled="!!pipeline.schemaId||pipeline.classes.length===1"
+                        :aria-label="`移除第 ${index+1} 类`"
+                      >
+                        ×
+                      </button>
+                    </div>
+                  </template>
+                  <button class="link" type="button" x-show="!pipeline.schemaId" @click="pipeline.classes.push(sourceRow({name:'',prompt:''}))">＋ 增加类别</button>
+                  <p class="hint" x-show="pipeline.schemaId">已有类别版本不可修改；要调整请清空选择后另建。</p>
+                </div>
+                <div class="form-grid">
+                  <label class="field">候选置信度阈值<input type="number" min="0.01" max="0.99" step="0.01" x-model="pipeline.boxThreshold" /></label>
+                  <label class="field">COCO 标注模型<select x-model="pipeline.cocoModel">
+                    <template x-for="model in annotationSources?.coco_models||[]" :key="model.name"><option :value="model.name" :selected="model.name===pipeline.cocoModel" :disabled="!model.available" x-text="`${model.name}${model.available?'':' · 尚未准备'}`"></option></template>
+                  </select></label>
+                </div>
+                <p class="hint">默认 YOLO26n，YOLO26s 为备选。项目模型不参与 test 预标注，test 自动回退 DINO。低置信框仍需人工检查；重复和面积异常框保留审计但不推送 CVAT。</p>
+                <p class="alert danger" x-show="annotationSourceError" x-text="annotationSourceError"></p>
+                <button type="button" class="link" @click="loadAnnotationSources(true)">刷新可用标注器</button>
+                <div class="note" x-show="pipeline.notes"><p x-text="pipeline.notes"></p></div>
+
+                <label class="field">流程名称<input x-model="pipeline.name" maxlength="200" placeholder="例：钢板缺陷 · 第一批" /></label>
+                <div class="note gate">
+                  <span aria-hidden="true">◇</span>
+                  <p>开始后系统自动检查数据、划分 train / val / test、生成候选框并送到 CVAT，然后停下等你审核。</p>
+                </div>
+                <div class="alert danger" role="alert" x-show="inlineError"><p x-text="inlineError"></p></div>
+                <button class="button primary block" @click="startPipeline()" :disabled="busy||!!startBlocker">开始自动标注 →</button>
+                <p class="hint" x-show="startBlocker" x-text="startBlocker"></p>
+              </section>
+              <section class="panel requirement-panel" x-show="uploadMode==='labeled'">
+                <div class="panel-head"><div><h2>已有标签，直接管理数据</h2><p class="meta">保留类别与原始划分</p></div></div>
+                <ol class="checklist">
+                  <li>选择包含 data.yaml 的整个文件夹，或上传 ZIP；原配置中的旧机器绝对 path 会自动忽略。</li>
+                  <li>后台核对图片与标签、类别编号和坐标，完成后生成一个新的数据版本。</li>
+                  <li>在下方版本中点击「查看标注 / 审核」。通过审核后，点击「封存为训练数据」，即可在训练页选择。</li>
+                </ol>
+                <p class="hint">需要迁移数据时，点击版本旁的「导出数据集」，完成后在后台任务中下载 ZIP。标签、类别、划分与审核状态清单会一起导出。</p>
+                <button class="button" :disabled="busy" @click="navigate('train')">前往训练 →</button>
+              </section>
+            </div>
+
+            <div class="grid-2" x-show="datasetId">
+              <section class="panel">
+                <div class="panel-head">
+                  <h2>版本</h2>
+                  <span class="meta">封存后划分不可变</span>
+                </div>
+                <div class="list">
+                  <template x-for="version in datasetVersions" :key="version.id">
+                    <div class="list-row dataset-version-row">
+                      <div>
+                        <strong x-text="`v${version.number} · ${version.name}`"></strong>
+                        <span
+                          class="hint num"
+                          x-text="`train ${version.summary.split_counts?.train??0} / val ${version.summary.split_counts?.val??0} / test ${version.summary.split_counts?.test??0}`"
+                        ></span>
+                        <span class="hint" x-show="version.summary.annotation_count!=null" x-text="`${version.summary.annotation_count??0} 个框 · 导入时待审核 ${version.summary.unreviewed_images??0} 张 · 裁剪 ${version.summary.clipped_boxes??0} 个框`"></span>
+                      </div>
+                      <div class="version-actions">
+                        <button class="button quiet small" :disabled="busy" @click="action(`/dataset-versions/${version.id}/exports`,'数据集导出已提交，完成后在后台任务中下载')">导出数据集</button>
+                        <button class="button quiet small" x-show="datasetAnnotation(version.id)" :disabled="busy" @click="openDatasetReview(version.id)">查看标注 / 审核</button>
+                        <button class="button quiet small" x-show="datasetAnnotation(version.id)?.status==='reviewed'" :disabled="busy" @click="action(`/annotation-runs/${datasetAnnotation(version.id)?.id}/exports`,'已提交审核工件封存，完成后可在训练页选择')">封存为训练数据</button>
+                        <a class="link" :href="`/api/v1/dataset-versions/${version.id}/manifest`" target="_blank" rel="noopener">清单 ↗</a>
+                      </div>
+                    </div>
+                  </template>
+                  <p class="hint" x-show="!datasetVersions.length">流程开始后会自动划分并封存版本。</p>
+                </div>
+                <div class="actions">
+                  <button class="button quiet small" :disabled="busy" @click="action(`/datasets/${datasetId}/analyses`,'分析任务已提交')">单独分析质量</button>
+                  <button class="button quiet small" :disabled="busy" @click="show('version')">手动封存版本</button>
+                </div>
+              </section>
+              <section class="panel">
+                <div class="panel-head">
+                  <h2>后台任务</h2>
+                  <span class="meta">最近 20 条</span>
+                </div>
+                <div class="list">
+                  <template x-for="task in datasetTasks" :key="task.id">
+                    <div class="task">
+                      <div class="row spread">
+                        <strong x-text="taskName(task.kind)"></strong>
+                        <span class="badge" :class="tone(task.status)" x-text="status(task.status)"></span>
+                      </div>
+                      <progress x-show="task.total>0" :value="task.processed" :max="task.total" :aria-label="`${task.processed}/${task.total}`"></progress>
+                      <p class="danger-text" x-show="task.error" x-text="task.error"></p>
+                      <a
+                        class="link"
+                        x-show="task.status==='completed'&&['analysis','version','import','labeled_import','dataset_export'].includes(task.kind)"
+                        :href="`/api/v1/dataset-tasks/${task.id}/report`"
+                        target="_blank"
+                        rel="noopener"
+                        >检查报告 ↗</a
+                      >
+                      <a class="button small" x-show="task.status==='completed'&&task.kind==='dataset_export'" :href="`/api/v1/dataset-tasks/${task.id}/download`">下载数据集 ZIP ↓</a>
+                    </div>
+                  </template>
+                  <p class="hint" x-show="!datasetTasks.length">尚无任务记录。</p>
+                </div>
+              </section>
+            </div>
+            <button class="button quiet more" x-show="moreAvailable.datasets" @click="more('datasets')">加载更多数据集</button>
+          </section>
+
+          <!-- 2 自动标注 -->
+          <section class="view" x-show="page==='annotate'&&projectId" aria-label="自动标注">
+            <div class="panel empty" x-show="!agent">
+              <h2>还没有流程</h2>
+              <p>先在第 1 步上传原图并写下需求，系统会接着完成自动标注。</p>
+              <button class="button primary" @click="navigate('upload')">去上传 →</button>
+            </div>
+            <template x-if="agent">
+              <div class="grid-main">
+                <section class="panel">
+                  <div class="panel-head">
+                    <h2>处理进度</h2>
+                    <span class="badge" :class="tone(agent.status)" x-text="status(agent.status)"></span>
+                  </div>
+                  <ol class="timeline">
+                    <template x-for="stage in pipelineStages" :key="stage.key">
+                      <li class="tl-item" :class="`is-${stage.state}`">
+                        <span class="tl-marker" aria-hidden="true" x-text="stage.state==='done'?'✓':stage.state==='failed'?'!':''"></span>
+                        <div class="tl-body">
+                          <div class="row spread">
+                            <strong x-text="stage.name"></strong>
+                            <span class="tl-state" x-text="stage.label"></span>
+                          </div>
+                          <p class="hint" x-show="stage.detail" x-text="stage.detail"></p>
+                          <progress x-show="stage.total" :value="stage.done" :max="stage.total" :aria-label="`${stage.done}/${stage.total}`"></progress>
+                        </div>
+                      </li>
+                    </template>
+                  </ol>
+                  <p class="danger-text mt" x-show="agent.error" x-text="agent.error"></p>
+                  <div class="actions" x-show="flowStep>=3">
+                    <button class="button primary" @click="navigate('review')">前往人工审核 →</button>
+                  </div>
+                </section>
+                <section class="panel">
+                  <div class="panel-head">
+                    <h2>后台任务</h2>
+                    <span class="meta" x-text="currentAnnotation?`批次 ${short(currentAnnotation.id)}`:'等待生成候选'"></span>
+                  </div>
+                  <div class="list">
+                    <template x-for="task in annotationTasks" :key="task.id">
+                      <div class="task">
+                        <div class="row spread">
+                          <strong x-text="taskName(task.kind)"></strong>
+                          <span class="badge" :class="tone(task.status)" x-text="status(task.status)"></span>
+                        </div>
+                        <div class="meta">
+                          <time x-text="time(task.finished_at||task.started_at||task.created_at)"></time>
+                        </div>
+                        <progress x-show="task.total>0" :value="task.processed" :max="task.total" :aria-label="`${task.processed}/${task.total}`"></progress>
+                        <p class="danger-text" x-show="task.error" x-text="task.error"></p>
+                      </div>
+                    </template>
+                    <p class="hint" x-show="!annotationTasks.length">候选推理开始后显示任务。</p>
+                  </div>
+                </section>
+              </div>
+            </template>
+
+            <template x-if="currentAnnotation">
+              <div class="grid-2">
+                <section class="panel">
+                  <div class="panel-head">
+                    <h2>候选框统计</h2>
+                    <span class="meta" x-text="`${currentAnnotation.processed}/${currentAnnotation.total} 图`"></span>
+                  </div>
+                  <div class="table-scroll">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th scope="col">类别</th>
+                          <th scope="col" class="num">待审</th>
+                          <th scope="col" class="num">批准</th>
+                          <th scope="col" class="num">修正</th>
+                          <th scope="col" class="num">拒绝</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <template x-for="[name,counts] in Object.entries(annotationQuality?.per_class||{})" :key="name">
+                          <tr>
+                            <th scope="row" x-text="name"></th>
+                            <td class="num" x-text="counts.pending||0"></td>
+                            <td class="num" x-text="counts.approved||0"></td>
+                            <td class="num" x-text="counts.corrected||0"></td>
+                            <td class="num" x-text="counts.rejected||0"></td>
+                          </tr>
+                        </template>
+                      </tbody>
+                    </table>
+                  </div>
+                  <div class="chips">
+                    <template x-for="[name,count] in Object.entries(annotationQuality?.flag_counts||{})" :key="name">
+                      <span class="chip" x-text="`${name} · ${count}`"></span>
+                    </template>
+                  </div>
+                </section>
+                <section class="panel">
+                  <div class="panel-head">
+                    <h2>候选预览</h2>
+                    <span class="meta">点击查看框</span>
+                  </div>
+                  <div class="image-grid compact">
+                    <template x-for="image in annotationImages" :key="image.id">
+                      <button class="image-card image-button" :aria-label="`预览标注：${image.original_name}`" @click="inspectAnnotation(image.id)">
+                        <img :src="`/api/v1/images/${image.id}/preview`" :alt="image.original_name" loading="lazy" />
+                        <span class="image-caption" x-text="image.original_name"></span>
+                      </button>
+                    </template>
+                  </div>
+                  <p class="hint" x-show="!annotationImages.length">候选生成后显示。</p>
+                </section>
+              </div>
+            </template>
+
+            <details class="panel manual">
+              <summary>手动标注（不经过 Agent 流程）</summary>
+              <div class="row mt">
+                <select aria-label="标注批次" x-show="annotations.length" x-model="annotationId" @change="read(chooseAnnotation(annotationId))">
+                  <template x-for="run in annotations" :key="run.id">
+                    <option :value="run.id" :selected="run.id===annotationId" x-text="`${short(run.id)} · ${status(run.status)} · ${run.total} 图`"></option>
+                  </template>
+                </select>
+                <button class="button" @click="show('schema')">新建类别版本</button>
+                <button class="button" @click="show('annotate')" :disabled="!versions.length||!schemas.length||busy">对已封存版本自动标注</button>
+              </div>
+              <p class="hint mt">手动批次同样只生成候选框，必须在「人工审核」回传后才能用于训练。</p>
+            </details>
+          </section>
+
+          <!-- 3 人工审核 -->
+          <section class="view" x-show="page==='review'&&projectId" aria-label="人工审核">
+            <template x-if="agent&&agent.phase==='cvat_review'&&agent.status==='needs_review'">
+              <section class="panel gate-card det">
+                <span class="det-tag">等你处理</span>
+                <div class="gate-grid">
+                  <div>
+                    <h2>在本页审核候选框</h2>
+                    <ol class="checklist">
+                      <li>逐图修正误检、补齐漏标，没有候选框的图片也要检查</li>
+                      <li>要新增类别，先在本页底部新建类别版本，保留原编号只追加</li>
+                      <li>在下方审核区保存修改，将所有作业设为 acceptance / completed 后确认</li>
+                    </ol>
+                    <p
+                      class="hint"
+                      x-show="annotationQuality?.needs_missed_object_check?.length"
+                      x-text="`还有 ${annotationQuality?.needs_missed_object_check?.length} 张图片未确认漏标检查。`"
+                    ></p>
+                  </div>
+                  <div class="gate-actions">
+                    <button class="button" @click="read(openCvatReview(agent.state.annotation_run_id))">进入下方审核区 ↓</button>
+                    <button class="button primary" @click="show('resumeAgent')">我已完成审核</button>
+                  </div>
+                </div>
+              </section>
+            </template>
+            <section class="panel" x-show="agent&&['annotation_validation','reviewed_export'].includes(agent.phase)">
+              <div class="panel-head">
+                <h2>正在回传审核结果并封存训练数据</h2>
+                <span class="badge info">处理中</span>
+              </div>
+              <p class="hint">服务会再次核对 CVAT 验收状态和实际框，完成后进入训练步骤。</p>
+            </section>
+            <section class="panel success-card" x-show="agent&&flowStep>=4&&!reusedExport">
+              <div class="panel-head">
+                <div>
+                  <h2>人工审核已通过</h2>
+                  <p class="meta" x-text="`训练数据 ${short(agent?.dataset_export_id)} 已封存`"></p>
+                </div>
+                <button class="button primary" @click="navigate('train')">前往训练 →</button>
+              </div>
+            </section>
+            <section class="panel" x-show="agent&&reusedExport">
+              <p class="hint">当前流程直接复用了已审核的数据，没有新的审核任务。</p>
+            </section>
+            <div class="panel empty" x-show="!currentAnnotation&&(!agent||(flowStep<3&&agent.status!=='failed'))">
+              <h2>还没到人工审核</h2>
+              <p x-text="agent?`流程正在「${agentStateText}」，候选框送到 CVAT 后会在这里提醒你。`:'先在第 1 步开始一个流程。'"></p>
+            </div>
+
+            <template x-if="page==='review'&&cvatEmbedUrl">
+              <section id="cvat-review" class="panel cvat-review-panel">
+                <div class="panel-head">
+                  <div><h2>人工审核工作区</h2><p class="meta" x-text="`CVAT 任务 ${currentAnnotation.cvat_task_id} · 批次 ${short(annotationId)}`"></p></div>
+                  <span class="badge info">CVAT 编辑器</span>
+                </div>
+                <p class="hint">首次使用请在下方登录 CVAT。进入作业逐图审核，保存修改并完成验收后，再点击本页的审核确认或回传按钮。</p>
+                <iframe :key="annotationId" :src="cvatEmbedUrl" title="CVAT 人工标注与审核编辑器" referrerpolicy="strict-origin-when-cross-origin" allow="fullscreen" allowfullscreen></iframe>
+              </section>
+            </template>
+            <div class="alert warning" role="status" x-show="page==='review'&&currentAnnotation?.cvat_task_id&&!cvatEmbedUrl">
+              <p>审核服务地址不可嵌入，请检查 CVAT 公共地址；HTTPS 工作台需要 HTTPS 审核服务。</p>
+            </div>
+
+            <div class="grid-2">
+              <section class="panel">
+                <div class="panel-head">
+                  <h2>类别审核统计</h2>
+                  <span class="meta" x-text="currentAnnotation?`批次 ${short(currentAnnotation.id)}`:''"></span>
+                </div>
+                <div class="table-scroll">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th scope="col">类别</th>
+                        <th scope="col" class="num">待审</th>
+                        <th scope="col" class="num">批准</th>
+                        <th scope="col" class="num">修正</th>
+                        <th scope="col" class="num">拒绝</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <template x-for="[name,counts] in Object.entries(annotationQuality?.per_class||{})" :key="name">
+                        <tr>
+                          <th scope="row" x-text="name"></th>
+                          <td class="num" x-text="counts.pending||0"></td>
+                          <td class="num" x-text="counts.approved||0"></td>
+                          <td class="num" x-text="counts.corrected||0"></td>
+                          <td class="num" x-text="counts.rejected||0"></td>
+                        </tr>
+                      </template>
+                    </tbody>
+                  </table>
+                </div>
+                <p class="hint mt" x-show="annotationQuality?.accuracy_reason" x-text="annotationQuality?.accuracy_reason"></p>
+                <h3 class="mt">来源与类别审核质量</h3>
+                <p class="hint" x-show="!annotationQuality?.source_quality_has_review_events">尚无人审回传记录，不能评价候选质量。</p>
+                <div class="table-scroll">
+                  <table>
+                    <thead><tr><th scope="col">来源</th><th scope="col">原类别</th><th scope="col" class="num">保留</th><th scope="col" class="num">修改</th><th scope="col" class="num">删除</th><th scope="col" class="num">补画</th><th scope="col" class="num">过滤</th><th scope="col" class="num">待审</th></tr></thead>
+                    <tbody><template x-for="row in annotationQuality?.source_class_stats||[]" :key="`${row.source}:${row.class_name}`"><tr><td x-text="annotationSourceName(row.source)"></td><th scope="row" x-text="row.class_name"></th><td class="num" x-text="row.retained"></td><td class="num" x-text="row.corrected"></td><td class="num" x-text="row.deleted"></td><td class="num" x-text="row.added"></td><td class="num" x-text="row.filtered"></td><td class="num" x-text="row.pending"></td></tr></template></tbody>
+                  </table>
+                </div>
+                <p class="hint mt" x-text="annotationQuality?.source_quality_reason||''"></p>
+              </section>
+              <section class="panel" x-show="currentAnnotation&&currentAnnotation.id!==agent?.state?.annotation_run_id">
+                <div class="panel-head">
+                  <div>
+                    <h2>手动批次审核</h2>
+                    <p class="meta" x-text="`批次 ${short(currentAnnotation?.id)} · ${status(currentAnnotation?.status)}`"></p>
+                  </div>
+                </div>
+                <div class="actions">
+                  <button
+                    class="button"
+                    x-show="currentAnnotation?.status==='pending_review'&&!currentAnnotation?.cvat_task_id"
+                    :disabled="busy"
+                    @click="action(`/annotation-runs/${annotationId}/cvat`,'已提交 CVAT 上传')"
+                  >
+                    发送到 CVAT
+                  </button>
+                  <button
+                    class="button"
+                    x-show="currentAnnotation?.cvat_task_id"
+                    @click="read(openCvatReview())"
+                    >进入上方审核区 ↑</button
+                  >
+                  <button
+                    class="button primary"
+                    x-show="currentAnnotation?.cvat_task_id&&currentAnnotation?.status==='pending_review'"
+                    @click="show('sync')"
+                    :disabled="busy"
+                  >
+                    回传人工审核
+                  </button>
+                  <button
+                    class="button primary"
+                    x-show="currentAnnotation?.status==='reviewed'"
+                    :disabled="busy"
+                    @click="action(`/annotation-runs/${annotationId}/exports`,'已提交训练数据封存')"
+                  >
+                    封存训练数据
+                  </button>
+                </div>
+                <p class="danger-text mt" x-show="currentAnnotation?.error" x-text="currentAnnotation?.error"></p>
+              </section>
+            </div>
+
+            <section class="panel">
+              <div class="panel-head">
+                <h2>已审训练数据</h2>
+                <span class="meta">只有这里的数据可以用于训练</span>
+              </div>
+              <div class="table-scroll" x-show="exports.length">
+                <table>
+                  <thead>
+                    <tr>
+                      <th scope="col">数据</th>
+                      <th scope="col" class="num">图片</th>
+                      <th scope="col" class="num">标注框</th>
+                      <th scope="col">固定划分</th>
+                      <th scope="col">下载</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <template x-for="item in exports" :key="item.id">
+                      <tr>
+                        <td><code x-text="short(item.id)"></code> <small class="hint" x-text="time(item.created_at)"></small></td>
+                        <td class="num" x-text="item.summary.image_count??'—'"></td>
+                        <td class="num" x-text="item.summary.annotation_count??'—'"></td>
+                        <td
+                          class="mono"
+                          x-text="`train ${item.summary.split_counts?.train??0} / val ${item.summary.split_counts?.val??0} / test ${item.summary.split_counts?.test??0}`"
+                        ></td>
+                        <td><a class="link" :href="`/api/v1/dataset-exports/${item.id}/download`">YOLO ZIP ↓</a></td>
+                      </tr>
+                    </template>
+                  </tbody>
+                </table>
+              </div>
+              <p class="empty compact" x-show="!exports.length">审核回传并封存后，数据出现在这里。</p>
+              <button class="link mt" x-show="moreAvailable.exports" @click="more('exports')">加载更多</button>
+            </section>
+
+            <section class="panel">
+              <div class="panel-head">
+                <h2>类别版本</h2>
+                <button class="button quiet small" @click="show('schema')">新建类别版本</button>
+              </div>
+              <template x-for="schema in schemas" :key="schema.id">
+                <div class="class-set">
+                  <div class="row">
+                    <strong x-text="schema.name"></strong>
+                    <code x-text="short(schema.id)"></code>
+                  </div>
+                  <div class="chips">
+                    <template x-for="category in schema.classes" :key="category.class_id">
+                      <span class="chip"
+                        ><code x-text="category.class_id"></code><span x-text="category.name"></span><small x-text="category.prompt"></small
+                      ></span>
+                    </template>
+                  </div>
+                </div>
+              </template>
+              <p class="hint" x-show="!schemas.length">在第 1 步确认类别后自动创建。</p>
+            </section>
+          </section>
+
+          <!-- 4 训练 -->
+          <section class="view" x-show="page==='train'&&projectId" aria-label="训练">
+            <template x-if="showTrainForm||trainingReadback">
+              <section class="panel start-panel" :class="{'gate-card det':setupMode,'parameter-readback':trainingReadback}">
+                <span class="det-tag" x-show="setupMode">等你处理</span>
+                <div class="panel-head">
+                  <div>
+                    <h2 x-text="trainingReadback?'Agent 训练参数':setupMode?'确认参数并开始训练':'从已审数据开始训练'"></h2>
+                    <p class="meta" aria-live="polite" x-text="trainingReadback?trainingParameterSource:setupMode?`训练数据 ${short(agent?.dataset_export_id)} 已封存`:'选择一份已人审封存的数据，Agent 在预算内自主迭代'"></p>
+                  </div>
+                  <button class="link" type="button" x-show="showTrainForm" :disabled="busy" @click="presetLocal()">填入本机验证预设</button>
+                </div>
+                <template x-if="showTrainForm&&!setupMode">
+                  <div class="form-grid">
+                    <label class="field"
+                      >已审训练数据<select x-model="trainForm.exportId" required>
+                        <option value="">请选择</option>
+                        <template x-for="item in exports" :key="item.id">
+                          <option
+                            :value="item.id"
+                            :selected="item.id===trainForm.exportId"
+                            x-text="`${short(item.id)} · ${item.summary.image_count??'—'} 图 · ${time(item.created_at)}`"
+                          ></option>
+                        </template>
+                      </select></label
+                    >
+                    <label class="field">流程名称<input x-model="trainForm.name" maxlength="200" placeholder="自主训练" /></label>
+                    <label class="field span-all"
+                      >需求说明<textarea x-model="trainForm.requirement" rows="2" maxlength="2000" placeholder="例：优先少漏检，部署到边缘设备"></textarea>
+                    </label>
+                  </div>
+                </template>
+                <fieldset :disabled="busy||trainingReadback">
+                  <legend><span x-text="trainingReadback?'本轮参数':'首轮参数'"></span> <span class="legend-note" x-text="trainingReadback?'只读':'可选'"></span></legend>
+                  <p class="hint" x-text="trainingReadback?'Agent 选定的实验配置会自动回填，后续轮次随决策更新。训练库实际采用值可在下方实验详情查看。':'留空由 Agent 决定。填写的值只约束第一轮，之后 Agent 会根据评估结果调整。'"></p>
+                  <div class="form-grid param-grid">
+                    <label class="field"
+                      >模型<select x-model="trainForm.params.model">
+                        <option value="">Agent 决定</option>
+                        <template x-for="name in trainingModelChoices" :key="name">
+                          <option :value="name" :selected="name===trainForm.params.model" x-text="name"></option>
+                        </template>
+                      </select></label
+                    >
+                    <label class="field">epochs<input type="number" min="1" max="1000" x-model="trainForm.params.epochs" placeholder="Agent 决定" /></label>
+                    <label class="field"
+                      >输入尺寸<select x-model="trainForm.params.imgsz">
+                        <option value="">Agent 决定</option>
+                        <template x-for="size in imgszChoices" :key="size">
+                          <option :value="size" :selected="String(size)===String(trainForm.params.imgsz)" x-text="size"></option>
+                        </template>
+                      </select></label
+                    >
+                    <label class="field">batch<input x-model="trainForm.params.batch" placeholder="auto、-1、张数或显存比例" /></label>
+                    <label class="field"
+                      >优化器<select x-model="trainForm.params.optimizer">
+                        <option value="">Agent 决定</option>
+                        <template x-for="name in trainingOptimizerChoices" :key="name">
+                          <option :value="name" :selected="name===trainForm.params.optimizer" x-text="name"></option>
+                        </template>
+                      </select></label
+                    >
+                    <label class="field"
+                      >lr0<input
+                        type="number"
+                        :min="searchSpace.lr0?.low"
+                        :max="searchSpace.lr0?.high"
+                        step="any"
+                        x-model="trainForm.params.lr0"
+                        placeholder="Agent 决定"
+                    /></label>
+                  </div>
+                  <template x-for="group in trainingParameterGroups" :key="group.name">
+                    <details class="parameter-group">
+                      <summary><span x-text="group.name"></span><small class="hint" x-text="`${group.fields.length} 项`"></small></summary>
+                      <div class="form-grid param-grid">
+                        <template x-for="field in group.fields" :key="field.name">
+                          <label class="field">
+                            <span class="mono" x-text="field.name"></span>
+                            <template x-if="parameterIsSelect(field)">
+                              <select x-model="trainForm.params[field.name]">
+                                <option value="">Agent 决定</option>
+                                <template x-for="option in parameterOptions(field)" :key="option.value">
+                                  <option :value="option.value" :selected="option.value===String(trainForm.params[field.name])" x-text="option.label"></option>
+                                </template>
+                              </select>
+                            </template>
+                            <template x-if="field.control==='layers'"><input x-model="trainForm.params[field.name]" placeholder="0 或 [0,1,2]" /></template>
+                            <template x-if="field.control==='number'&&!parameterIsSelect(field)">
+                              <input type="number" :min="parameterBound(field,'min')" :max="parameterBound(field,'max')" :step="field.type==='integer'?1:'any'" x-model="trainForm.params[field.name]" :placeholder="`Agent 决定 · 默认 ${field.default}`" />
+                            </template>
+                            <small class="hint" x-show="field.description" x-text="field.description"></small>
+                          </label>
+                        </template>
+                      </div>
+                    </details>
+                  </template>
+                  <p class="hint">参数说明参考 <a href="https://docs.ultralytics.com/zh/modes/train/" target="_blank" rel="noopener noreferrer">Ultralytics 官方文档</a>。参与自动搜索的维度另受操作者搜索范围约束，多尺度最大尺寸仍受下方预算限制。</p>
+                </fieldset>
+                <fieldset :disabled="busy||trainingReadback">
+                  <legend>预算</legend>
+                  <div class="form-grid param-grid">
+                    <label class="field">最多实验数<input type="number" min="1" max="20" x-model="trainForm.budget.max_experiments" required /></label>
+                    <label class="field"
+                      >总训练小时<input type="number" min="0.001" max="48" step="any" x-model="trainForm.budget.max_training_hours" required
+                    /></label>
+                    <label class="field"
+                      >单实验 epochs 上限<input type="number" min="1" max="1000" x-model="trainForm.budget.max_epochs_per_experiment" required
+                    /></label>
+                    <label class="field"
+                      >输入尺寸上限<select x-model="trainForm.budget.max_imgsz">
+                        <template x-for="size in searchSpace.imgsz||[]" :key="size">
+                          <option :value="size" :selected="String(size)===String(trainForm.budget.max_imgsz)" x-text="size"></option>
+                        </template>
+                      </select></label
+                    >
+                    <label class="field">连续无提升轮数<input type="number" min="1" max="20" x-model="trainForm.budget.stagnation_rounds" required /></label>
+                    <label class="field"
+                      >最小明显提升<input type="number" min="0" max="0.1" step="any" x-model="trainForm.budget.minimum_improvement" required
+                    /></label>
+                  </div>
+                  <label class="field"
+                    >用途<select x-model="trainForm.budget.purpose">
+                      <option value="model_optimization">模型优化：优先可信评估与数据质量</option>
+                      <option value="development_validation">软件验收：小规模 CPU 闭环验证</option>
+                    </select></label
+                  >
+                  <p class="hint" x-show="setupMode">预算只能收紧，不能超过流程创建时的上限。</p>
+                </fieldset>
+                <div class="alert danger" role="alert" x-show="inlineError"><p x-text="inlineError"></p></div>
+                <div class="actions" x-show="showTrainForm">
+                  <button class="button primary" @click="startTraining()" :disabled="busy||!llmReady||(!setupMode&&!trainForm.exportId)">
+                    开始训练 →
+                  </button>
+                  <span class="hint" x-show="!llmReady">未配置模型服务，无法启动 Agent。</span>
+                </div>
+              </section>
+            </template>
+
+            <template x-if="agent&&flowStep>=4&&!setupMode">
+              <section class="panel agent-panel">
+                <div class="panel-head">
+                  <div>
+                    <span class="label" x-text="agent.policy.purpose==='development_validation'?'软件闭环验收':'模型优化'"></span>
+                    <h2 x-text="agentStateText"></h2>
+                    <p class="meta pre-wrap" x-show="agentStateDetail" x-text="agentStateDetail"></p>
+                  </div>
+                  <div class="row">
+                    <button
+                      class="button"
+                      x-show="['queued','running','waiting'].includes(agent.status)"
+                      :disabled="busy"
+                      @click="action(`/agent-runs/${agentId}/pause`,'已请求暂停后续编排')"
+                    >
+                      暂停
+                    </button>
+                    <button
+                      class="button primary"
+                      x-show="agent.status==='paused'"
+                      :disabled="busy"
+                      @click="action(`/agent-runs/${agentId}/resume`,'已请求继续')"
+                    >
+                      继续
+                    </button>
+                    <button class="button primary" x-show="['needs_review','failed'].includes(agent.status)" @click="show('resumeAgent')">人工处理</button>
+                    <button
+                      class="button danger-outline"
+                      x-show="!['completed','stopped'].includes(agent.status)"
+                      :disabled="busy||agent.status==='canceling'"
+                      @click="action(`/agent-runs/${agentId}/stop`,'已请求停止，正在保存检查点与报告')"
+                    >
+                      停止
+                    </button>
+                    <a class="button" x-show="agent.report_sha256" :href="`/api/v1/agent-runs/${agentId}/report.md`">运行报告 ↓</a>
+                    <button class="button" x-show="['completed','stopped'].includes(agent.status)" @click="newTraining()">开始新的训练</button>
+                  </div>
+                </div>
+                <div class="meters">
+                  <div class="meter">
+                    <div class="row spread">
+                      <span>实验</span><strong class="num" x-text="`${agentBudget?.experiments??'—'} / ${agent.policy.max_experiments}`"></strong>
+                    </div>
+                    <progress :value="agentBudget?.experiments??0" :max="agent.policy.max_experiments" aria-label="实验数预算使用量"></progress>
+                  </div>
+                  <div class="meter">
+                    <div class="row spread">
+                      <span>训练时间</span
+                      ><strong
+                        class="num"
+                        x-text="`${metric(agentBudget?.training_seconds==null?null:agentBudget.training_seconds/60,1)} 分 / ${agent.policy.max_training_hours} 时`"
+                      ></strong>
+                    </div>
+                    <progress :value="(agentBudget?.training_seconds??0)/3600" :max="agent.policy.max_training_hours" aria-label="训练时间预算使用量"></progress>
+                  </div>
+                  <div class="meter">
+                    <div class="row spread">
+                      <span>模型调用</span><strong class="num" x-text="`${agent.state.model_calls??0} / ${agent.policy.max_model_calls??'—'}`"></strong>
+                    </div>
+                    <progress :value="agent.state.model_calls??0" :max="agent.policy.max_model_calls||120" aria-label="模型调用次数"></progress>
+                  </div>
+                  <div class="meter">
+                    <div class="row spread">
+                      <span>连续无明显提升</span
+                      ><strong class="num" x-text="`${agent.state.stagnation?.rounds_without_improvement??0} / ${agent.policy.stagnation_rounds}`"></strong>
+                    </div>
+                    <progress
+                      :value="agent.state.stagnation?.rounds_without_improvement??0"
+                      :max="agent.policy.stagnation_rounds"
+                      aria-label="连续无明显提升轮数"
+                    ></progress>
+                  </div>
+                </div>
+                <template x-if="agent.phase==='agent_review'&&agent.status==='needs_review'">
+                  <div class="note gate mt">
+                    <span aria-hidden="true">◇</span>
+                    <div>
+                      <strong>Agent 请求你处理</strong>
+                      <p x-text="agent.state.review_request?.reason"></p>
+                      <ul x-show="agent.state.review_request?.data_actions?.length">
+                        <template x-for="(text,index) in agent.state.review_request?.data_actions||[]" :key="index">
+                          <li x-text="text"></li>
+                        </template>
+                      </ul>
+                    </div>
+                  </div>
+                </template>
+                <template x-if="agent.state.stop_notice">
+                  <div class="alert warning mt" role="status">
+                    <strong>已因连续无明显提升停止</strong>
+                    <p x-text="agent.state.stop_notice.message"></p>
+                    <ul>
+                      <template x-for="(text,index) in agent.state.stop_notice.recommendations" :key="index">
+                        <li x-text="text"></li>
+                      </template>
+                    </ul>
+                  </div>
+                </template>
+                <p class="danger-text mt" x-show="agent.error" x-text="agent.error"></p>
+              </section>
+            </template>
+
+            <div class="panel empty" x-show="agent&&flowStep<4">
+              <h2>还没到训练</h2>
+              <p x-text="`当前流程正在「${agentStateText}」，人工审核通过后在这里开始训练。`"></p>
+              <button class="link" @click="newTraining()">改为从已审数据新开一个训练 →</button>
+            </div>
+
+            <div class="grid-main" x-show="experiments.length">
+              <section class="panel">
+                <div class="panel-head">
+                  <div>
+                    <h2>训练实况</h2>
+                    <p class="meta" x-text="experiment?experiment.name:'选择实验'"></p>
+                  </div>
+                  <select aria-label="选择实验" x-model="experimentId" @change="read(chooseExperiment(experimentId))">
+                    <template x-for="item in experiments" :key="item.id">
+                      <option :value="item.id" :selected="item.id===experimentId" x-text="item.name"></option>
+                    </template>
+                  </select>
+                </div>
+                <template x-if="trainingTasks[0]">
+                  <div class="training-progress">
+                    <div class="row spread">
+                      <span class="num" x-text="`${trainingTasks[0].current_epoch} / ${trainingTasks[0].total_epochs} epochs`"></span>
+                      <span class="row">
+                        <span class="badge" :class="tone(trainingTasks[0].status)" x-text="status(trainingTasks[0].status)"></span>
+                        <span class="meta" x-text="trainingTasks[0].device||'等待 Worker'"></span>
+                      </span>
+                    </div>
+                    <progress :value="trainingTasks[0].current_epoch" :max="trainingTasks[0].total_epochs" aria-label="实际 epoch 进度"></progress>
+                    <p class="danger-text" x-show="trainingTasks[0].error" x-text="trainingTasks[0].error"></p>
+                  </div>
+                </template>
+                <div class="chart-pair" x-show="epochs.length">
+                  <div>
+                    <h3>Loss</h3>
+                    <div class="chart-wrap"><canvas id="training-loss" role="img" aria-label="真实训练 Loss 随 epoch 变化"></canvas></div>
+                  </div>
+                  <div>
+                    <h3>验证 mAP50–95</h3>
+                    <div class="chart-wrap"><canvas id="training-map" role="img" aria-label="验证集 mAP50–95 随 epoch 变化"></canvas></div>
+                  </div>
+                </div>
+                <p class="empty compact" x-show="!epochs.length">训练开始后显示曲线。</p>
+                <div class="actions" x-show="experiment">
+                  <button
+                    class="button quiet small"
+                    x-show="['created','failed','stopped'].includes(experiment?.status)"
+                    :disabled="busy"
+                    @click="action(`/experiments/${experimentId}/train`,'训练任务已提交')"
+                  >
+                    开始新尝试
+                  </button>
+                  <button
+                    class="button quiet small"
+                    x-show="['failed','stopped'].includes(experiment?.status)"
+                    :disabled="busy"
+                    @click="action(`/experiments/${experimentId}/resume`,'已提交检查点恢复')"
+                  >
+                    从检查点恢复
+                  </button>
+                  <button
+                    class="button quiet small danger-outline"
+                    x-show="trainingTasks[0]&&['queued','running','canceling'].includes(trainingTasks[0].status)"
+                    :disabled="busy||trainingTasks[0]?.status==='canceling'"
+                    @click="action(`/training-tasks/${trainingTaskId}/cancel`,'已请求在批次边界停止，正在保留检查点')"
+                  >
+                    停止这次训练
+                  </button>
+                  <button class="link" @click="navigate('experiments')">评估与对比 →</button>
+                </div>
+              </section>
+
+              <section class="panel activity-panel">
+                <div class="panel-head">
+                  <h2>Agent 动态</h2>
+                  <span class="meta" x-text="agent?`${timeline.length} 条`:''"></span>
+                </div>
+                <ol class="activity">
+                  <template x-for="item in timeline.slice(0,60)" :key="item.id">
+                    <li class="act" :class="`is-${item.tone}`">
+                      <time x-text="clock(item.time)"></time>
+                      <div>
+                        <strong x-text="item.title"></strong>
+                        <p x-show="item.detail" x-text="item.detail"></p>
+                        <p class="act-reason" x-show="item.reason" x-text="item.reason"></p>
+                      </div>
+                    </li>
+                  </template>
+                </ol>
+                <p class="hint" x-show="!timeline.length">开始训练后，这里显示 Agent 每一步的动作与理由。</p>
+              </section>
+            </div>
+
+            <section class="panel flush" x-show="agentIterations.length">
+              <div class="panel-head padded">
+                <h2>每轮实验</h2>
+                <span class="meta">固定 val 协议 · mAP50–95</span>
+              </div>
+              <div class="table-scroll">
+                <table>
+                  <thead>
+                    <tr>
+                      <th scope="col">轮次</th>
+                      <th scope="col">相对父实验的调整</th>
+                      <th scope="col">理由</th>
+                      <th scope="col" class="num">mAP50–95</th>
+                      <th scope="col" class="num">相对父实验变化</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <template x-for="item in agentIterations" :key="item.iteration">
+                      <tr :class="{'row-selected':item.experiment_id===experimentId}">
+                        <td>
+                          <button class="link" @click="read(chooseExperiment(item.experiment_id))" x-text="`第 ${item.iteration+1} 轮`"></button>
+                        </td>
+                        <td class="mono small" x-text="changeSummary(item)"></td>
+                        <td class="reason-cell">
+                          <p x-text="item.plan.reason"></p>
+                          <small x-show="item.conclusion?.causal_limit" x-text="item.conclusion?.causal_limit"></small>
+                        </td>
+                        <td class="num" x-text="item.conclusion?.abandoned?'已放弃':metric(item.conclusion?.map50_95)"></td>
+                        <td
+                          class="num"
+                          :class="{'up':item.conclusion?.delta_parent>0,'down':item.conclusion?.delta_parent<0}"
+                          x-text="item.conclusion?.delta_parent==null?'—':(item.conclusion.delta_parent>0?'+':'')+metric(item.conclusion.delta_parent)"
+                        ></td>
+                      </tr>
+                    </template>
+                  </tbody>
+                </table>
+              </div>
+            </section>
+
+            <div class="grid-2" x-show="experiment">
+              <section class="panel console-panel">
+                <div class="panel-head">
+                  <h2>训练日志</h2>
+                  <code x-text="short(trainingTaskId)"></code>
+                </div>
+                <pre class="training-log" x-text="trainingLogs||'当前没有日志输出。'"></pre>
+              </section>
+              <section class="panel">
+                <div class="panel-head">
+                  <h2>启动与恢复历史</h2>
+                </div>
+                <div class="list">
+                  <template x-for="task in trainingTasks" :key="task.id">
+                    <div class="list-row">
+                      <div>
+                        <code x-text="short(task.id)"></code>
+                        <span class="hint" x-text="task.parent_task_id?`恢复自 ${short(task.parent_task_id)}`:'新训练尝试'"></span>
+                        <time class="hint" x-text="time(task.started_at||task.created_at)"></time>
+                      </div>
+                      <span class="badge" :class="tone(task.status)" x-text="status(task.status)"></span>
+                    </div>
+                  </template>
+                  <p class="hint" x-show="!trainingTasks.length">尚未启动训练。</p>
+                </div>
+                <details class="mt">
+                  <summary>请求与实际解析配置</summary>
+                  <pre x-text="JSON.stringify({requested:experiment?.parameters,resolved:experiment?.resolved_parameters},null,2)"></pre>
+                </details>
+              </section>
+            </div>
+          </section>
+
+          <!-- 5 导出模型 -->
+          <section class="view" x-show="page==='export'&&projectId" aria-label="导出模型">
+            <template x-if="exportCandidate">
+              <section class="panel candidate-panel">
+                <div class="panel-head">
+                  <div>
+                    <span class="label" x-text="exportCandidate.source"></span>
+                    <h2 x-text="`第 ${exportCandidate.iteration+1} 轮 · ${exportCandidate.kind==='best'?'最佳轮权重':'最后轮权重'}`"></h2>
+                    <p class="meta" x-text="`实验 ${short(exportCandidate.experiment_id)} · 权重 ${short(exportCandidate.model_id)}`"></p>
+                  </div>
+                  <span class="badge plain" x-text="exportCandidate.model_id===overview?.production_model_id?'当前生产模型':'未发布 · 需人工确认'"></span>
+                </div>
+                <div class="stats">
+                  <div>
+                    <span>验证 mAP50–95</span>
+                    <strong x-text="metric(exportCandidate.map50_95)"></strong>
+                  </div>
+                  <div>
+                    <span>SHA256</span>
+                    <strong class="hash" :title="exportCandidate.sha256" x-text="exportCandidate.sha256?`${exportCandidate.sha256.slice(0,12)}…`:'—'"></strong>
+                  </div>
+                </div>
+                <div class="actions">
+                  <button class="button primary" :disabled="busy" @click="exportModel(exportCandidate.model_id,'onnx')">导出 ONNX</button>
+                  <button class="button" :disabled="busy" @click="exportModel(exportCandidate.model_id,'torchscript')">导出 TorchScript</button>
+                  <a class="button" :href="`/api/v1/models/${exportCandidate.model_id}/download`">下载 .pt ↓</a>
+                  <button class="link" :disabled="busy||exportCandidate.model_id===overview?.production_model_id" @click="preparePublish(exportCandidate.model_id)">
+                    发布到生产…
+                  </button>
+                </div>
+                <div class="export-list" x-show="exportsFor(exportCandidate.model_id).length">
+                  <template x-for="item in exportsFor(exportCandidate.model_id)" :key="item.id">
+                    <div class="export-row">
+                      <strong x-text="formatName(item.format)"></strong>
+                      <span class="badge" :class="tone(item.status)" x-text="status(item.status)"></span>
+                      <span class="hint num" x-text="item.size_bytes?bytes(item.size_bytes):''"></span>
+                      <span class="hint" x-text="item.verification?`${item.verification.runtime} 加载通过`:item.error||''"></span>
+                      <a class="link" x-show="item.status==='completed'" :href="`/api/v1/model-exports/${item.id}/download`">下载 ↓</a>
+                    </div>
+                  </template>
+                </div>
+              </section>
+            </template>
+            <div class="panel empty" x-show="!exportCandidate">
+              <h2>当前流程还没有选出模型</h2>
+              <p>训练完成并通过验证评估后，Agent 选出的模型会出现在这里；下方也可以直接导出任意权重。</p>
+            </div>
+
+            <section class="panel flush">
+              <div class="panel-head padded">
+                <h2>全部权重</h2>
+                <span class="row">
+                  <span class="hint">生产模型</span>
+                  <span
+                    class="badge"
+                    :class="overview?.production_model_id?'success':'neutral'"
+                    x-text="overview?.production_model_id?short(overview.production_model_id):'尚未发布'"
+                  ></span>
+                </span>
+              </div>
+              <div class="table-scroll" x-show="models.length">
+                <table>
+                  <thead>
+                    <tr>
+                      <th scope="col">权重</th>
+                      <th scope="col">实验</th>
+                      <th scope="col">状态</th>
+                      <th scope="col">导出</th>
+                      <th scope="col">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <template x-for="item in models" :key="item.id">
+                      <tr>
+                        <td>
+                          <strong x-text="item.kind==='best'?'最佳轮':'最后轮'"></strong>
+                          <code x-text="short(item.id)"></code>
+                        </td>
+                        <td>
+                          <button class="link mono" @click="experimentId=item.experiment_id;navigate('experiments')" x-text="short(item.experiment_id)"></button>
+                        </td>
+                        <td><span class="badge" :class="tone(item.status)" x-text="status(item.status)"></span></td>
+                        <td>
+                          <div class="chips tight">
+                            <template x-for="record in exportsFor(item.id)" :key="record.id">
+                              <a
+                                class="chip"
+                                :class="`is-${record.status}`"
+                                :href="record.status==='completed'?`/api/v1/model-exports/${record.id}/download`:null"
+                                x-text="`${formatName(record.format)} · ${status(record.status)}`"
+                              ></a>
+                            </template>
+                          </div>
+                        </td>
+                        <td>
+                          <div class="row loose">
+                            <a class="link" :href="`/api/v1/models/${item.id}/download`">.pt ↓</a>
+                            <button class="link" :disabled="busy" @click="exportModel(item.id,'onnx')">ONNX</button>
+                            <button class="link" :disabled="busy" @click="exportModel(item.id,'torchscript')">TorchScript</button>
+                            <button class="link" :disabled="busy" @click="action(`/models/${item.id}/evaluate`,'已提交默认验证集评估')">评估</button>
+                            <button class="link" :disabled="busy||item.id===overview?.production_model_id" @click="preparePublish(item.id)">发布…</button>
+                          </div>
+                        </td>
+                      </tr>
+                    </template>
+                  </tbody>
+                </table>
+              </div>
+              <p class="empty compact" x-show="!models.length">训练完成后保存 best / last 权重。</p>
+            </section>
+            <button class="button quiet more" x-show="moreAvailable.models" @click="more('models')">加载更多权重</button>
+
+            <section class="panel">
+              <div class="panel-head">
+                <h2>生产发布记录</h2>
+                <span class="meta">只能人工确认发布</span>
+              </div>
+              <div class="list">
+                <template x-for="item in publications" :key="item.id">
+                  <div class="list-row">
+                    <div>
+                      <strong x-text="`${short(item.model_id)} · ${item.reviewer}`"></strong>
+                      <p class="small" x-text="item.reason"></p>
+                      <time class="hint" x-text="time(item.created_at)"></time>
+                    </div>
+                    <a class="link" :href="`/api/v1/model-publications/${item.id}/download`">发布副本 ↓</a>
+                  </div>
+                </template>
+                <p class="hint" x-show="!publications.length">还没有发布记录。</p>
+              </div>
+            </section>
+          </section>
+
+          <!-- 项目 -->
+          <section class="view" x-show="page==='projects'" aria-label="项目管理">
+            <div class="toolbar">
+              <p class="hint" x-text="`共 ${projects.length} 个项目`"></p>
+              <button class="button primary" @click="show('project')" :disabled="busy">＋ 创建项目</button>
+            </div>
+            <div class="project-grid">
+              <template x-for="item in projects" :key="item.id">
+                <article class="panel project-card" :class="{'is-current':item.id===rememberedProjectId}">
+                  <span class="det-tag" x-show="item.id===rememberedProjectId">上次访问</span>
+                  <h2 x-text="item.name"></h2>
+                  <p x-text="item.description||'暂无说明'"></p>
+                  <code x-text="item.id"></code>
+                  <div class="actions">
+                    <button class="button" @click="openProject(item.id)">进入工作区 →</button>
+                    <time x-text="time(item.created_at)"></time>
+                  </div>
+                </article>
+              </template>
+            </div>
+          </section>
+
+          <!-- 实验对比 -->
+          <section class="view" x-show="page==='experiments'&&projectId" aria-label="实验与评估">
+            <div class="toolbar">
+              <p class="hint">勾选 2–8 个实验进行对比</p>
+              <div class="row">
+                <button class="button" @click="compare()" :disabled="compareIds.length<2||compareIds.length>8">
+                  对比选中项 <span class="num" x-text="compareIds.length"></span>
+                </button>
+                <button class="button primary" @click="show('experiment')" :disabled="!exports.length">手动创建实验</button>
+              </div>
+            </div>
+            <section class="panel flush">
+              <div class="table-scroll" x-show="experiments.length">
+                <table>
+                  <thead>
+                    <tr>
+                      <th scope="col">对比</th>
+                      <th scope="col">实验</th>
+                      <th scope="col">配置</th>
+                      <th scope="col">状态</th>
+                      <th scope="col" class="num">验证 mAP50–95</th>
+                      <th scope="col">详情</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <template x-for="item in experiments" :key="item.id">
+                      <tr :class="{'row-selected':item.id===experimentId}">
+                        <td><input type="checkbox" :value="item.id" x-model="compareIds" :aria-label="`选择实验 ${item.name}`" /></td>
+                        <td>
+                          <strong x-text="item.name"></strong>
+                          <code x-text="short(item.id)"></code>
+                        </td>
+                        <td>
+                          <span x-text="`${item.parameters.model} · ${item.parameters.imgsz} · ${item.parameters.epochs} epochs`"></span>
+                          <small class="hint block" x-text="item.parameters.optimizer"></small>
+                        </td>
+                        <td><span class="badge" :class="tone(item.status)" x-text="status(item.status)"></span></td>
+                        <td class="num" x-text="metric(item.final_metrics?.['metrics/mAP50-95(B)'])"></td>
+                        <td><button class="link" @click="read(chooseExperiment(item.id))">查看 →</button></td>
+                      </tr>
+                    </template>
+                  </tbody>
+                </table>
+              </div>
+              <p class="empty compact" x-show="!experiments.length">还没有实验。</p>
+            </section>
+            <button class="button quiet more" x-show="moreAvailable.experiments" @click="more('experiments')">加载更多实验</button>
+
+            <template x-if="comparison">
+              <section class="panel">
+                <div class="panel-head">
+                  <h2>实验对比</h2>
+                  <span
+                    class="badge"
+                    :class="comparison.same_dataset?'success':'warning'"
+                    x-text="comparison.same_dataset?'同一份训练数据':'数据不同，不能直接归因'"
+                  ></span>
+                </div>
+                <div class="comparison-grid">
+                  <template x-for="item in comparison.items" :key="item.id">
+                    <article class="comparison-item">
+                      <h3 x-text="item.name"></h3>
+                      <strong class="metric-number" x-text="metric(item.metrics?.map50_95??item.metrics?.['metrics/mAP50-95(B)'])"></strong>
+                      <small x-text="item.metric_source==='independent_validation'?'独立验证 mAP50–95':'训练末尾验证 mAP50–95'"></small>
+                      <details>
+                        <summary>配置与改动原因</summary>
+                        <pre x-text="JSON.stringify(item.parameters,null,2)"></pre>
+                        <p class="pre-wrap mt" x-text="item.optimization_reason"></p>
+                        <pre x-text="JSON.stringify(item.changed_variables,null,2)"></pre>
+                      </details>
+                    </article>
+                  </template>
+                </div>
+              </section>
+            </template>
+
+            <template x-if="experiment">
+              <section class="panel">
+                <div class="panel-head">
+                  <div>
+                    <span class="label">选中实验</span>
+                    <h2 x-text="experiment.name"></h2>
+                  </div>
+                  <button class="link" @click="navigate('train')">训练详情 →</button>
+                </div>
+                <p class="pre-wrap small" x-show="experiment.optimization_reason" x-text="experiment.optimization_reason"></p>
+                <div class="row loose mt">
+                  <code x-text="`训练数据 ${short(experiment.dataset_export_id)}`"></code>
+                  <code x-text="`父实验 ${short(experiment.parent_experiment_id)}`"></code>
+                </div>
+                <div class="field-inline mt">
+                  <label for="evaluation-select">独立评估</label>
+                  <select id="evaluation-select" x-model="evaluationId" @change="read(chooseEvaluation(evaluationId))">
+                    <option value="">选择已完成报告</option>
+                    <template x-for="item in evaluations.filter(x=>x.status==='completed'&&!x.invalidated_reason)" :key="item.id">
+                      <option :value="item.id" :selected="item.id===evaluationId" x-text="`${short(item.id)} · ${time(item.created_at)}`"></option>
+                    </template>
+                  </select>
+                </div>
+                <p class="hint mt" x-show="!evaluations.some(x=>x.status==='completed'&&!x.invalidated_reason)">暂无有效评估，可在「导出模型」页提交评估。</p>
+              </section>
+            </template>
+
+            <template x-if="evaluationReport&&evaluationId">
+              <div class="stack">
+                <section class="panel">
+                  <div class="panel-head">
+                    <h2>验证报告</h2>
+                    <a class="link" :href="`/api/v1/evaluations/${evaluationId}/report`" target="_blank" rel="noopener">完整报告 ↗</a>
+                  </div>
+                  <div class="stats">
+                    <div><span>mAP50</span><strong x-text="metric(evaluationReport.summary.map50)"></strong></div>
+                    <div><span>mAP50–95</span><strong x-text="metric(evaluationReport.summary.map50_95)"></strong></div>
+                    <div><span>Precision · 最佳 F1 点</span><strong x-text="metric(evaluationReport.summary.precision)"></strong></div>
+                    <div><span>Recall · 最佳 F1 点</span><strong x-text="metric(evaluationReport.summary.recall)"></strong></div>
+                    <div><span>验证图片</span><strong x-text="evaluationReport.summary.validation_images"></strong></div>
+                    <div><span>真值实例</span><strong x-text="evaluationReport.summary.validation_instances"></strong></div>
+                  </div>
+                  <div class="chips">
+                    <template x-for="(text,index) in evaluationReport.limitations" :key="index">
+                      <span class="chip" x-text="text"></span>
+                    </template>
+                  </div>
+                  <div class="table-scroll mt">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th scope="col">类别</th>
+                          <th scope="col" class="num">train 真值</th>
+                          <th scope="col" class="num">val 真值</th>
+                          <th scope="col" class="num">AP50</th>
+                          <th scope="col" class="num">AP50–95</th>
+                          <th scope="col">说明</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <template x-for="item in evaluationReport.per_class" :key="item.class_id">
+                          <tr>
+                            <th scope="row" x-text="item.name"></th>
+                            <td class="num" x-text="item.train_instances"></td>
+                            <td class="num" x-text="item.validation_instances"></td>
+                            <td class="num" x-text="metric(item.ap50)"></td>
+                            <td class="num" x-text="metric(item.ap50_95)"></td>
+                            <td class="hint" x-text="item.unavailable_reason||'—'"></td>
+                          </tr>
+                        </template>
+                      </tbody>
+                    </table>
+                  </div>
+                </section>
+                <div class="grid-2">
+                  <section class="panel">
+                    <div class="panel-head"><h2>Precision–Recall</h2></div>
+                    <div class="chart-wrap"><canvas id="pr-chart" role="img" aria-label="实际验证集 PR 曲线"></canvas></div>
+                  </section>
+                  <section class="panel">
+                    <div class="panel-head"><h2>混淆矩阵</h2></div>
+                    <img
+                      class="matrix-image"
+                      :src="`/api/v1/evaluations/${evaluationId}/artifacts/validation/confusion_matrix.png`"
+                      alt="验证集混淆矩阵，行是预测，列是真值"
+                      loading="lazy"
+                    />
+                  </section>
+                </div>
+                <section class="panel">
+                  <div class="panel-head">
+                    <div>
+                      <span class="label">固定阈值错误定位</span>
+                      <h2 x-text="`${errorTotal} 张错误图片`"></h2>
+                    </div>
+                    <span class="meta num" x-text="`conf ${evaluationReport.summary.errors.confidence} · IoU ${evaluationReport.summary.errors.iou}`"></span>
+                  </div>
+                  <div class="legend">
+                    <span><span class="swatch" aria-hidden="true"></span>匹配 TP</span>
+                    <span><span class="swatch is-fp" aria-hidden="true"></span>误检 FP</span>
+                    <span><span class="swatch is-fn" aria-hidden="true"></span>漏检 FN</span>
+                    <span><span class="swatch dashed" aria-hidden="true"></span>虚线为真值框</span>
+                  </div>
+                  <div class="error-grid">
+                    <template x-for="item in errorImages" :key="item.image_id">
+                      <article class="error-card">
+                        <div class="error-image">
+                          <img :src="`/api/v1/evaluations/${evaluationId}/images/${item.image_id}`" :alt="`错误定位 ${item.image_id}`" loading="lazy" />
+                          <template x-for="(box,index) in item.ground_truth" :key="`gt-${index}`">
+                            <div class="error-box ground-truth" :class="`is-${box.status}`" :style="errorBoxStyle(box)" aria-hidden="true"></div>
+                          </template>
+                          <template x-for="(box,index) in item.predictions" :key="`pred-${index}`">
+                            <div class="error-box" :class="`is-${box.status}`" :style="errorBoxStyle(box)" aria-hidden="true"></div>
+                          </template>
+                        </div>
+                        <div class="image-caption">
+                          <code x-text="short(item.image_id)"></code>
+                          <span class="num" x-text="`TP ${item.counts.tp} · FP ${item.counts.fp} · FN ${item.counts.fn}`"></span>
+                        </div>
+                        <details>
+                          <summary>框、类别与置信度</summary>
+                          <pre x-text="JSON.stringify(item,null,2)"></pre>
+                        </details>
+                      </article>
+                    </template>
+                  </div>
+                  <p x-show="!errorImages.length" class="hint mt">当前阈值下没有错误图片。</p>
+                  <div class="pagination" x-show="errorTotal>12">
+                    <button class="button quiet small" :disabled="errorOffset===0" @click="errorOffset-=12;read(chooseEvaluation(evaluationId,false))">← 上一页</button>
+                    <button class="button quiet small" :disabled="errorOffset+12>=errorTotal" @click="errorOffset+=12;read(chooseEvaluation(evaluationId,false))">下一页 →</button>
+                  </div>
+                  <div class="note mt">
+                    <p
+                      x-text="evaluationReport.summary.errors.small_objects.unavailable_reason||`按原图面积定义的小目标召回：${metric(evaluationReport.summary.errors.small_objects.recall)}`"
+                    ></p>
+                  </div>
+                </section>
+              </div>
+            </template>
+          </section>
+
+          <!-- Agent 记录 -->
+          <section class="view" x-show="page==='agents'&&projectId" aria-label="Agent 执行记录">
+            <div class="toolbar">
+              <div class="field-inline" x-show="agents.length">
+                <label for="agent-select">流程</label>
+                <select id="agent-select" x-model="agentId" @change="read(chooseAgent(agentId))">
+                  <template x-for="item in agents" :key="item.id">
+                    <option :value="item.id" :selected="item.id===agentId" x-text="`${item.name} · ${status(item.status)}`"></option>
+                  </template>
+                </select>
+              </div>
+              <div class="row">
+                <button class="button" @click="navigate('upload')">从原图开始</button>
+                <button class="button primary" @click="trainNew=true;navigate('train')">从已审数据训练</button>
+              </div>
+            </div>
+            <template x-if="agent">
+              <div class="stack">
+                <section class="panel">
+                  <div class="panel-head">
+                    <div>
+                      <span class="label" x-text="agent.policy.purpose==='development_validation'?'软件闭环验收':'模型优化'"></span>
+                      <h2 x-text="agent.name"></h2>
+                      <p class="meta" x-text="`当前：${agentStateText} · 创建于 ${time(agent.created_at)}`"></p>
+                    </div>
+                    <span class="badge" :class="tone(agent.status)" x-text="status(agent.status)"></span>
+                  </div>
+                  <div class="note" x-show="agent.requirement">
+                    <p><strong>需求说明：</strong><span x-text="agent.requirement"></span></p>
+                  </div>
+                  <dl class="facts mt">
+                    <div><dt>入口</dt><dd x-text="reusedExport?'已审数据':'原始图片'"></dd></div>
+                    <div><dt>数据版本</dt><dd><code x-text="short(agent.dataset_version_id)"></code></dd></div>
+                    <div><dt>训练数据</dt><dd><code x-text="short(agent?.dataset_export_id)"></code></dd></div>
+                    <div><dt>最佳权重</dt><dd><code x-text="short(agent.best_model_id)"></code></dd></div>
+                  </dl>
+                  <div class="actions">
+                    <a class="button" x-show="agent.report_sha256" :href="`/api/v1/agent-runs/${agentId}/report.md`">下载运行报告 ↓</a>
+                    <button class="link" @click="navigate('train')">查看训练 →</button>
+                  </div>
+                  <p class="danger-text mt" x-show="agent.error" x-text="agent.error"></p>
+                </section>
+                <section class="panel">
+                  <div class="panel-head">
+                    <h2>执行事件</h2>
+                    <span class="meta" x-text="`${agentEvents.length} 条`"></span>
+                  </div>
+                  <div class="event-list">
+                    <template x-for="event in agentEvents.slice().reverse()" :key="event.id">
+                      <details class="event-row">
+                        <summary>
+                          <span class="event-dot" :class="{'danger':event.level==='error','warning':event.level==='warning'}"></span>
+                          <time x-text="time(event.created_at)"></time>
+                          <strong x-text="phase(event.node)"></strong>
+                          <span x-text="eventName(event)"></span>
+                        </summary>
+                        <pre x-text="JSON.stringify(event.payload,null,2)"></pre>
+                      </details>
+                    </template>
+                  </div>
+                </section>
+              </div>
+            </template>
+            <div class="panel empty" x-show="!agents.length">
+              <h2>还没有流程</h2>
+              <p>从原图开始会经过自动标注和人工审核；已有审核过的数据可以直接训练。</p>
+              <button class="button primary" @click="navigate('upload')">从原图开始</button>
+            </div>
+            <button class="button quiet more" x-show="moreAvailable.agents" @click="more('agents')">加载更多历史流程</button>
+          </section>
+
+          <footer class="page-foot">
+            <a href="/guide/README" target="_blank" rel="noopener">使用说明 ↗</a>
+            <a href="/docs" target="_blank" rel="noopener">API ↗</a>
+            <a href="/licenses" target="_blank" rel="noopener">开源组件</a>
+          </footer>
+        </main>
+      </div>
+
+      <div class="toast" role="status" aria-live="polite" x-show="notice">
+        <span aria-hidden="true">✓</span>
+        <span x-text="notice"></span>
+        <button type="button" class="icon-button" @click="notice=''" aria-label="关闭状态提示">×</button>
+      </div>
+
+      <dialog class="form-dialog" aria-labelledby="dialog-title" x-ref="dialog" @cancel="if(busy)$event.preventDefault()" @close="modal=null;formError=''">
+        <form @submit.prevent="submit()">
+          <div class="dialog-head">
+            <div>
+              <span class="label">当前项目 · <span x-text="overview?.project?.name||'新工作区'"></span></span>
+              <h2 id="dialog-title" x-text="dialogTitle"></h2>
+            </div>
+            <button type="button" class="icon-button" @click="closeDialog()" :disabled="busy" aria-label="关闭对话框">×</button>
+          </div>
+          <div class="dialog-body">
+            <div class="alert danger" role="alert" x-show="formError">
+              <p x-text="formError"></p>
+            </div>
+            <template x-if="['project','dataset','version','schema','experiment'].includes(modal)">
+              <label class="field"
+                >名称<input x-model="form.name" :required="['project','dataset','schema'].includes(modal)" maxlength="200" autocomplete="off" autofocus
+              /></label>
+            </template>
+            <template x-if="['project','dataset'].includes(modal)">
+              <label class="field">说明<textarea x-model="form.description" rows="3" maxlength="4000"></textarea></label>
+            </template>
+
+            <template x-if="modal==='version'">
+              <div class="stack">
+                <div class="form-grid">
+                  <label class="field">train 比例<input type="number" min="0.01" max="0.98" step="0.01" x-model="form.train_ratio" /></label>
+                  <label class="field">val 比例<input type="number" min="0.01" max="0.98" step="0.01" x-model="form.val_ratio" /></label>
+                  <label class="field">test 比例<input type="number" min="0.01" max="0.98" step="0.01" x-model="form.test_ratio" /></label>
+                </div>
+                <p class="hint">三者之和须为 1，至少需要 3 个独立分组；封存后成员与划分不可修改。</p>
+              </div>
+            </template>
+
+            <template x-if="modal==='schema'">
+              <div class="stack">
+                <p class="hint">类别 ID 从 0 起连续分配；英文提示词用于 Grounding DINO 自动标注。</p>
+                <template x-for="(row,index) in form.classes" :key="index">
+                  <div class="class-row">
+                    <code x-text="index"></code>
+                    <input :aria-label="`第 ${index+1} 类名称`" x-model="row.name" required maxlength="100" placeholder="类别名称" />
+                    <input class="mono" :aria-label="`第 ${index+1} 类英文提示词`" x-model="row.prompt" required maxlength="80" placeholder="person" />
+                    <button
+                      type="button"
+                      class="icon-button"
+                      @click="form.classes.splice(index,1)"
+                      :disabled="form.classes.length===1"
+                      :aria-label="`移除第 ${index+1} 类`"
+                    >
+                      ×
+                    </button>
+                  </div>
+                </template>
+                <button class="button" type="button" @click="form.classes.push({name:'',prompt:''})" :disabled="form.classes.length>=100">＋ 增加类别</button>
+              </div>
+            </template>
+
+            <template x-if="modal==='annotate'">
+              <div class="stack">
+                <label class="field"
+                  >已封存图片版本<select x-model="form.version_id" required>
+                    <template x-for="item in versions" :key="item.id">
+                      <option :value="item.id" :selected="item.id===form.version_id" x-text="`${item.name} · v${item.number} · ${short(item.id)}`"></option>
+                    </template>
+                  </select></label
+                >
+                <label class="field"
+                  >类别版本<select x-model="form.class_schema_id" @change="resetManualSources()" required>
+                    <template x-for="item in schemas" :key="item.id">
+                      <option :value="item.id" :selected="item.id===form.class_schema_id" x-text="`${item.name} · ${item.classes.length} 类`"></option>
+                    </template>
+                  </select></label
+                >
+                <div class="class-editor source-editor">
+                  <template x-for="(row,index) in form.sourceRows" :key="index">
+                    <div class="class-row">
+                      <code x-text="index"></code><span x-text="row.name"></span><small class="class-prompt mono" x-text="row.prompt"></small>
+                      <div class="class-source">
+                        <select x-model="row.source" :aria-label="`第 ${index+1} 类候选来源`"><option value="yolo26_coco">COCO 预训练</option><option value="grounding_dino">DINO 兜底</option><option value="project_model" :disabled="!sourceModels(row).length">项目 best 模型</option></select>
+                        <template x-if="row.source==='yolo26_coco'"><select x-model="row.coco_class" :aria-label="`第 ${index+1} 类 COCO 对应类`"><option value="">选择 COCO 类别</option><template x-for="name in annotationSources?.coco_classes||[]" :key="name"><option :value="name" :selected="name===row.coco_class" x-text="name"></option></template></select></template>
+                        <template x-if="row.source==='project_model'"><select x-model="row.model_id" :aria-label="`第 ${index+1} 类项目模型`"><option value="">选择项目模型</option><template x-for="model in sourceModels(row)" :key="model.model_id"><option :value="model.model_id" :selected="model.model_id===row.model_id" x-text="`${model.base_model} · ${short(model.model_id)}`"></option></template></select></template>
+                      </div>
+                    </div>
+                  </template>
+                </div>
+                <div class="form-grid">
+                  <label class="field">候选置信度阈值<input type="number" min="0.01" max="0.99" step="0.01" x-model="form.box_threshold" /></label>
+                  <label class="field">COCO 标注模型<select x-model="form.coco_model"><template x-for="model in annotationSources?.coco_models||[]" :key="model.name"><option :value="model.name" :selected="model.name===form.coco_model" :disabled="!model.available" x-text="model.name"></option></template></select></label>
+                </div>
+                <p class="hint">默认 YOLO26n；项目模型对 test 图片自动回退 DINO。来源选择不修改类别版本。</p>
+                <p class="alert danger" x-show="annotationSourceError" x-text="annotationSourceError"></p>
+                <div class="note gate">
+                  <span aria-hidden="true">◇</span>
+                  <p>只生成候选框，之后必须在 CVAT 人工审核才能用于训练。</p>
+                </div>
+              </div>
+            </template>
+
+            <template x-if="['sync','resumeAgent'].includes(modal)">
+              <div class="stack">
+                <label class="field">操作者<input x-model="form.reviewer" required maxlength="100" autocomplete="name" /></label>
+                <template x-if="modal==='resumeAgent'">
+                  <label class="field"
+                    ><span x-text="agent?.phase==='agent_review'?'处理说明（会转达给 Agent）':'说明'"></span
+                    ><textarea x-model="form.reason" required minlength="5" maxlength="2000" rows="3"></textarea>
+                  </label>
+                </template>
+                <template x-if="modal==='sync'||['cvat_review','annotation_validation'].includes(agent?.phase)">
+                  <div class="stack">
+                    <label class="checkbox-field"
+                      ><input type="checkbox" x-model="form.checked" required /><span
+                        >已在 CVAT 完成逐图审核、漏标检查，并将所有作业设为 acceptance / completed。</span
+                      ></label
+                    >
+                    <label class="field"
+                      >审核期间新增的类别版本（可选）<select x-model="form.reviewed_class_schema_id">
+                        <option value="">沿用当前类别版本</option>
+                        <template x-for="item in schemas" :key="item.id">
+                          <option :value="item.id" :selected="item.id===form.reviewed_class_schema_id" x-text="`${item.name} · ${short(item.id)}`"></option>
+                        </template>
+                      </select></label
+                    >
+                  </div>
+                </template>
+              </div>
+            </template>
+
+            <template x-if="modal==='experiment'">
+              <div class="stack">
+                <label class="field"
+                  >已审训练数据<select x-model="form.dataset_export_id" required>
+                    <option value="">请选择</option>
+                    <template x-for="item in exports" :key="item.id">
+                      <option :value="item.id" :selected="item.id===form.dataset_export_id" x-text="`${short(item.id)} · ${time(item.created_at)}`"></option>
+                    </template>
+                  </select></label
+                >
+                <div class="form-grid">
+                  <label class="field"
+                    >模型<select x-model="form.parameters.model">
+                      <template x-for="name in preparedModels" :key="name">
+                        <option :value="name" :selected="name===form.parameters.model" x-text="name"></option>
+                      </template>
+                    </select></label
+                  >
+                  <label class="field">epochs<input type="number" min="1" max="1000" x-model="form.parameters.epochs" required /></label>
+                  <label class="field">输入尺寸<input type="number" min="64" max="2560" step="32" x-model="form.parameters.imgsz" required /></label>
+                  <label class="field">batch<input x-model="form.parameters.batch" required placeholder="auto、-1、张数或显存比例" /></label>
+                  <label class="field"
+                    >优化器<select x-model="form.parameters.optimizer">
+                      <template x-for="name in trainingOptimizers" :key="name">
+                        <option :value="name" :selected="name===form.parameters.optimizer" x-text="name"></option>
+                      </template>
+                    </select></label
+                  >
+                  <label class="field">lr0<input type="number" min="0.000001" max="0.1" step="any" x-model="form.parameters.lr0" required /></label>
+                </div>
+                <template x-for="group in trainingParameterGroups" :key="group.name">
+                  <details class="parameter-group">
+                    <summary><span x-text="group.name"></span><small class="hint" x-text="`${group.fields.length} 项`"></small></summary>
+                    <div class="form-grid param-grid">
+                      <template x-for="field in group.fields" :key="field.name">
+                        <label class="field">
+                          <span class="mono" x-text="field.name"></span>
+                          <template x-if="parameterIsSelect(field,false)">
+                            <select x-model="form.parameters[field.name]">
+                              <template x-for="option in parameterOptions(field)" :key="option.value">
+                                <option :value="option.value" :selected="option.value===String(form.parameters[field.name])" x-text="option.label"></option>
+                              </template>
+                            </select>
+                          </template>
+                          <template x-if="field.control==='layers'"><input x-model="form.parameters[field.name]" placeholder="0 或 [0,1,2]" /></template>
+                          <template x-if="field.control==='number'&&!parameterIsSelect(field,false)">
+                            <input type="number" :min="field.minimum??field.exclusiveMinimum" :max="field.maximum??field.exclusiveMaximum" :step="field.type==='integer'?1:'any'" x-model="form.parameters[field.name]" />
+                          </template>
+                          <small class="hint" x-show="field.description" x-text="field.description"></small>
+                        </label>
+                      </template>
+                    </div>
+                  </details>
+                </template>
+                <p class="hint">配置创建后冻结，到「训练」页的训练实况中启动。</p>
+              </div>
+            </template>
+
+            <template x-if="modal==='publish'&&publishPreview">
+              <div class="stack">
+                <div class="alert warning">
+                  <strong>此操作会替换生产模型</strong>
+                  <p>核对指标、样本支持量、旧版本和权重指纹后再确认。</p>
+                </div>
+                <dl class="review-facts">
+                  <div><dt>选中模型</dt><dd><code x-text="publishPreview.model_id"></code></dd></div>
+                  <div><dt>将被替换的版本</dt><dd><code x-text="publishPreview.current_model_id||'当前没有生产版本'"></code></dd></div>
+                  <div><dt>验证 mAP50–95</dt><dd class="mono" x-text="metric(publishPreview.metrics.map50_95)"></dd></div>
+                  <div><dt>权重 SHA256</dt><dd><code x-text="publishPreview.sha256"></code></dd></div>
+                </dl>
+                <div class="note">
+                  <p
+                    x-text="`验证支持：${publishPreview.metrics.validation_images} 张图 / ${publishPreview.metrics.validation_instances} 个真值。缺少真值的类别不能推断 AP。`"
+                  ></p>
+                </div>
+                <div class="chips" x-show="publishPreview.warnings?.length">
+                  <template x-for="(text,index) in publishPreview.warnings" :key="index">
+                    <span class="chip" x-text="text"></span>
+                  </template>
+                </div>
+                <details>
+                  <summary>各类别验证支持量与 AP</summary>
+                  <pre x-text="JSON.stringify(publishPreview.per_class,null,2)"></pre>
+                </details>
+                <label class="field">发布确认人<input x-model="form.reviewer" required maxlength="100" /></label>
+                <label class="field">发布理由<textarea x-model="form.reason" required minlength="5" maxlength="2000" rows="3"></textarea></label>
+                <label class="field"
+                  >输入指纹末 8 位确认选中权重<input
+                    class="mono"
+                    x-model="form.confirmToken"
+                    required
+                    minlength="8"
+                    maxlength="8"
+                    :placeholder="publishPreview.sha256.slice(-8)"
+                    autocomplete="off"
+                /></label>
+                <label class="checkbox-field"
+                  ><input type="checkbox" x-model="form.approve" required /><span>我已核对上述版本和评估局限，明确批准更新生产指针。</span></label
+                >
+              </div>
+            </template>
+
+            <template x-if="modal==='annotationImage'&&annotationImage">
+              <div class="stack">
+                <div class="annotation-preview">
+                  <img :src="`/api/v1/images/${annotationImage.image.id}/preview`" :alt="annotationImage.image.original_name" />
+                  <template x-for="box in annotationImage.boxes.filter(x=>x.review_status!=='rejected')" :key="box.id">
+                    <div class="preview-box" :style="boxStyle(box)">
+                      <span x-text="`${box.class_name} · ${box.confidence==null?status(box.review_status):metric(box.confidence,2)}`"></span>
+                    </div>
+                  </template>
+                </div>
+                <p class="hint">只读预览，修改请到 CVAT。</p>
+                <details>
+                  <summary>候选、审核与来源记录</summary>
+                  <pre x-text="JSON.stringify(annotationImage.boxes,null,2)"></pre>
+                </details>
+              </div>
+            </template>
+          </div>
+          <div class="dialog-foot">
+            <button type="button" class="button" @click="closeDialog()" :disabled="busy" x-text="modal==='annotationImage'?'关闭':'取消'"></button>
+            <button
+              type="submit"
+              class="button"
+              :class="modal==='publish'?'danger-solid':'primary'"
+              x-show="modal!=='annotationImage'"
+              :disabled="busy"
+              x-text="busy?'正在提交…':({publish:'按人工确认发布',sync:'确认并提交回传',resumeAgent:'提交并继续'}[modal]||'提交')"
+            ></button>
+          </div>
+        </form>
+      </dialog>
+    </div>
+  </body>
+</html>

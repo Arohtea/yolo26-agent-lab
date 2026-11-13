@@ -1,0 +1,9 @@
+services:
+  worker:
+    networks: [default, cvat-internal]
+  agent-controller:
+    networks: [default, cvat-internal]
+networks:
+  cvat-internal:
+    external: true
+    name: ${YOLO_CVAT_NETWORK:-cvat_cvat}

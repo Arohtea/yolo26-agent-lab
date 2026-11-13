@@ -1,0 +1,9 @@
+.git
+.env
+storage
+data
+experiments
+models
+__pycache__
+*.egg-info
+.code-review-graph
