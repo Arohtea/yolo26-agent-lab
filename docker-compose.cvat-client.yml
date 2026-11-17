@@ -1,6 +1,8 @@
 services:
   worker:
     networks: [default, cvat-internal]
+  data-worker:
+    networks: [default, cvat-internal]
   agent-controller:
     networks: [default, cvat-internal]
 networks:

@@ -1,6 +1,7 @@
 """管理界面聚合查询与显式人工发布入口。"""
 
 import hashlib
+from collections import defaultdict
 
 import yaml
 
@@ -10,7 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from yolo_agent.models.agent import AgentRun
-from yolo_agent.models.annotation import AnnotationRun, DatasetExport
+from yolo_agent.models.annotation import AnnotationRun, DatasetExport, ImageReview
 from yolo_agent.models.dataset import Dataset, DatasetImage, DatasetVersion, Project
 from yolo_agent.models.experiment import Experiment, ModelArtifact, TrainingTask
 from yolo_agent.models.publication import ModelPublication, ProjectProductionModel
@@ -22,6 +23,54 @@ from yolo_agent.services.publication import PublicationService
 from yolo_agent.settings import get_settings
 
 router=APIRouter(prefix="/api/v1",tags=["管理工作区"])
+
+
+@router.get("/workspace/datasets")
+def dataset_catalog(request: Request, project_id: str | None = None):
+    """批量读取各份数据的真实身份、来源与版本状态，供所有步骤统一选择。"""
+    with Session(request.app.state.engine) as session:
+        statement = select(Dataset).where(Dataset.deleted_at.is_(None))
+        if project_id:
+            statement = statement.where(Dataset.project_id == project_id)
+        datasets = list(session.scalars(statement.order_by(Dataset.created_at.desc())))
+        identities = [row.id for row in datasets]
+        versions = list(session.scalars(select(DatasetVersion).where(DatasetVersion.dataset_id.in_(identities)).order_by(DatasetVersion.number.desc())))
+        version_ids = [row.id for row in versions]
+        runs = list(session.scalars(select(AnnotationRun).where(AnnotationRun.version_id.in_(version_ids)).order_by(AnnotationRun.created_at.desc())))
+        counts = dict(session.execute(select(DatasetImage.dataset_id, func.count()).where(
+            DatasetImage.dataset_id.in_(identities), DatasetImage.deleted_at.is_(None)).group_by(DatasetImage.dataset_id)).all())
+        reviewed = dict(session.execute(select(ImageReview.run_id, func.count()).where(
+            ImageReview.run_id.in_([row.id for row in runs]), ImageReview.status.in_(["approved", "corrected"]),
+            ImageReview.missed_objects_checked.is_(True)).group_by(ImageReview.run_id)).all())
+        exports = list(session.scalars(select(DatasetExport).where(DatasetExport.version_id.in_(version_ids)).order_by(DatasetExport.created_at.desc())))
+        versions_by_dataset = defaultdict(list)
+        for version in versions:
+            versions_by_dataset[version.dataset_id].append(version)
+        latest_runs, ready_exports = {}, {}
+        for run in runs:
+            latest_runs.setdefault(run.version_id, run)
+        for export in exports:
+            if export.summary.get("ready_for_training"):
+                ready_exports.setdefault(export.run_id, export)
+        result = []
+        for dataset in datasets:
+            entries = []
+            for version in versions_by_dataset[dataset.id]:
+                run = latest_runs.get(version.id)
+                export = ready_exports.get(run.id) if run else None
+                external = bool(run and run.parameters.get("review_attribution"))
+                attribution = run.parameters.get("review_attribution", {}) if run else {}
+                reviewed_source = attribution.get("accepted_reviewed_source", attribution.get("source") == "external_reviewed_yolo")
+                source = "reviewed_upload" if external and reviewed_source else "labeled_upload" if external else "raw_images"
+                status = "ready" if export and run and run.status == "exported" else "reviewed" if run and run.status == "reviewed" else "needs_review" if run and run.status == "pending_review" else "stopped" if run and run.status in {"failed", "stopped"} else "annotating" if run else "unlabeled"
+                entries.append({"id": version.id, "number": version.number, "name": version.name,
+                    "source": source, "status": status, "image_count": version.summary.get("image_count", 0),
+                    "annotation_run_id": run.id if run else None, "dataset_export_id": export.id if export else None,
+                    "reviewed_images": reviewed.get(run.id, 0) if run else 0,
+                    "total_images": run.total if run else version.summary.get("image_count", 0)})
+            result.append({"id": dataset.id, "project_id": dataset.project_id, "name": dataset.name,
+                "image_count": counts.get(dataset.id, 0), "versions": entries})
+        return result
 
 
 def publication_service(request: Request) -> PublicationService:

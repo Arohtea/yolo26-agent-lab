@@ -55,6 +55,8 @@ class RuntimeReport(BaseModel):
     selection_error: str | None = None
     gpus: list[GPUInfo] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    queue_name: str | None = None
+    worker_role: str | None = None
 
 
 class DeviceUnavailableError(RuntimeError):

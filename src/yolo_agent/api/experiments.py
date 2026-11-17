@@ -130,6 +130,11 @@ def cancel_training(task_id: str,service: TrainingService=Depends(training_servi
     :param service: 训练服务。
     :returns: 已停止或正在停止的状态。
     """
+    from yolo_agent.services.task_control import stop_owner
+    with Session(service.engine) as session, session.begin():
+        task = session.get(TrainingTask, task_id)
+        if task and task.status in {"queued", "running", "canceling"}:
+            stop_owner(session, "training", task)
     return service.cancel(task_id)
 
 
@@ -277,7 +282,7 @@ def list_model_exports(project_id: str|None=None,model_id: str|None=None,service
         statement=statement.join(Experiment).where(Experiment.project_id==project_id)
     with Session(service.engine) as session:
         ids=list(session.scalars(statement))
-    return [service.get(item.id) if item.status in {"queued","running"} else item for item in service.list(model_ids=ids)]
+    return [service.get(item.id) if item.status in {"queued","running","canceling"} else item for item in service.list(model_ids=ids)]
 
 
 @router.get("/model-exports/{export_id}/download",response_class=FileResponse)
@@ -298,3 +303,10 @@ def download_model_export(export_id: str,service: ExportService=Depends(export_s
         if hashlib.file_digest(stream,"sha256").hexdigest()!=record.sha256:
             raise DatasetError(409,"导出文件指纹变化")
     return FileResponse(path,media_type="application/octet-stream",filename=path.name)
+
+
+@router.post("/model-exports/{export_id}/cancel")
+def cancel_model_export(export_id: str, service: ExportService=Depends(export_service)):
+    """终止模型转换，同时停止所属自主流程的后续调度。"""
+    from yolo_agent.services.task_control import cancel_task
+    return cancel_task(service.engine, service.settings, "export", export_id)

@@ -53,12 +53,13 @@ class DatasetTask(Base):
 
     __tablename__ = "dataset_tasks"
     __table_args__ = (
-        Index("uq_dataset_active_task", "dataset_id", unique=True, sqlite_where=text("status IN ('uploading', 'queued', 'running')")),
+        Index("uq_dataset_active_task", "dataset_id", unique=True, sqlite_where=text("status IN ('uploading', 'queued', 'running','canceling')")),
     )
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     dataset_id: Mapped[str] = mapped_column(ForeignKey("datasets.id"), index=True)
     kind: Mapped[str]
     status: Mapped[str] = mapped_column(default="queued")
+    stop_requested: Mapped[bool] = mapped_column(default=False)
     parameters: Mapped[dict] = mapped_column(JSON, default=dict)
     result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     error: Mapped[str | None]

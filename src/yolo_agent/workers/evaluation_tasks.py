@@ -32,6 +32,11 @@ from yolo_agent.utils.logging import configure_logging
 logger = logging.getLogger(__name__)
 
 
+def on_evaluation_stopped(job, connection) -> None:
+    """RQ 停止回调立即收敛验证任务。"""
+    on_evaluation_failure(job, connection, RuntimeError, "操作者终止评估", None)
+
+
 def on_evaluation_failure(job, connection, exc_type, exc_value, traceback) -> None:
     """计算超时与进程异常必须写回业务库。
 
@@ -45,6 +50,8 @@ def on_evaluation_failure(job, connection, exc_type, exc_value, traceback) -> No
     engine = create_database_engine(get_settings())
     try:
         fail_evaluation(engine, job.id, f"{getattr(exc_type,'__name__',str(exc_type))}: {exc_value}")
+        from yolo_agent.services.garbage import collect_evaluation_garbage
+        collect_evaluation_garbage(engine, get_settings(), job.id)
     finally:
         engine.dispose()
 
@@ -88,6 +95,13 @@ def run_evaluation_task(task_id: str) -> dict:
             training_parameters, training_run = experiment.parameters, experiment.mlflow_run_id
             execution_limits = task.execution_limits
         # 校验完整数据可能持续较久，任务领取事务必须先提交，保留日志和控制写入能力。
+        def progress(stage, completed_batches=0, total_batches=0):
+            from yolo_agent.services.task_control import require_running
+            with Session(engine) as session, session.begin():
+                current = session.get(EvaluationTask, task_id)
+                require_running(current)
+                current.summary = {"progress": {"stage": stage, "completed_batches": completed_batches, "total_batches": total_batches}}
+        progress("verifying_inputs")
         manifest = validate_export(settings, export, verify_files=True)
         with model_path.open("rb") as stream:
             if hashlib.file_digest(stream,"sha256").hexdigest() != model_sha:
@@ -129,11 +143,18 @@ def run_evaluation_task(task_id: str) -> dict:
                 category_mapping.update({category:class_id for class_id,category in enumerate(validator.class_map)})
 
             detector.add_callback("on_val_end", capture_categories)
+            batch_progress = {"done": 0}
+            def validation_batch(validator):
+                batch_progress["done"] += 1
+                progress("validating", batch_progress["done"], len(validator.dataloader))
+            detector.add_callback("on_val_batch_end", validation_batch)
+            progress("validating")
             metrics = detector.val(data=str(data_path), split="val", imgsz=training_parameters["imgsz"], tile=training_parameters.get("tile", False), batch=2 if device=="cpu" else 1, device=device, workers=0, conf=0.001, iou=0.7, max_det=300, save_json=True, plots=True, project=str(output), name="validation", exist_ok=True, verbose=True)
             validation_dir = output / "validation"
             predictions_path = validation_dir / "predictions.json"
             predictions = json.loads(predictions_path.read_text()) if predictions_path.is_file() else []
             predictions = [{**item,"class_id":category_mapping[item["category_id"]]} for item in predictions]
+            progress("analyzing_errors")
             errors = analyze_errors(settings, task_id, root, output, classes, predictions, parameters)
 
             by_class = {int(class_id):index for index,class_id in enumerate(metrics.box.ap_class_index)}
@@ -187,6 +208,8 @@ def run_evaluation_task(task_id: str) -> dict:
                 tracking_id = tracking.info.run_id
         with Session(engine) as session, session.begin():
             task = session.get(EvaluationTask, task_id)
+            from yolo_agent.services.task_control import require_running
+            require_running(task)
             task.status, task.finished_at = "completed", utc_now()
             task.summary = _json_value(summary)
             task.report_path = report_path.relative_to(settings.storage_dir.resolve()).as_posix()
@@ -196,6 +219,8 @@ def run_evaluation_task(task_id: str) -> dict:
         return {"evaluation_id":task_id,"status":"completed","summary":_json_value(summary)}
     except Exception as error:
         fail_evaluation(engine, task_id, f"{type(error).__name__}: {error}")
+        from yolo_agent.services.garbage import collect_evaluation_garbage
+        collect_evaluation_garbage(engine, settings, task_id)
         logger.exception("验证评估失败", extra={"task_id":task_id})
         raise
     finally:

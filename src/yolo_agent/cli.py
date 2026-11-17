@@ -22,6 +22,7 @@ def main() -> None:
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("api", help="启动 HTTP 控制面")
     subparsers.add_parser("worker", help="启动独立计算 Worker")
+    subparsers.add_parser("annotation-worker", help="启动独立自动标注 Worker，默认 CPU，与训练并行")
     subparsers.add_parser("agent-controller", help="推进持久化自主流程，不在节点中执行训练")
     subparsers.add_parser("init-db", help="升级数据库到当前迁移版本")
     runtime = subparsers.add_parser("runtime", help="输出真实环境与设备选择结果")
@@ -45,6 +46,10 @@ def main() -> None:
             from yolo_agent.workers.runner import run_worker
 
             run_worker(settings)
+        elif args.command == "annotation-worker":
+            from yolo_agent.workers.runner import run_annotation_worker
+
+            run_annotation_worker(settings)
         elif args.command == "agent-controller":
             from yolo_agent.agents.controller import run_controller
             run_controller(settings)

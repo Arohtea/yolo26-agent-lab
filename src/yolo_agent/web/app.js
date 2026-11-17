@@ -67,6 +67,14 @@
   };
   const PHASE_ORDER = Object.keys(PHASE_STEP);
   const tools = {
+    Skill: "读取训练技能",
+    SkillRead: "读取技能参考",
+    inspect_training_parameters: "查询可调参数",
+    read_dataset_examples: "检查已审样例",
+    read_validation_errors: "筛选验证错误",
+    compare_experiments: "对比历史实验",
+    preview_experiment: "预检训练方案",
+    answer_operator: "回答你的问题",
     read_chart: "读取指标图",
     read_confusion_matrix: "读取矩阵结构化证据",
     get_experiment: "查看实验详情",
@@ -95,6 +103,7 @@
     val_labels: "验证真值",
   };
   const lists = {
+    datasetCatalog: "/workspace/datasets",
     datasets: "/datasets",
     versions: "/dataset-versions",
     schemas: "/class-schemas",
@@ -188,6 +197,13 @@
   function lab() {
     const charts = new Map();
     const uploadRequests = new Map();
+    let promptOptimizationRequest = null;
+    let promptOptimizationTicket = 0;
+    let agentChatTicket = 0;
+    let trainingLogResumeTimer = null;
+    let trainingLogPointer = null;
+    let trainingLogTouching = false;
+    let trainingLogView = 0;
     let uploadSequence = 0;
     let labeledFiles = [];
     const detailTickets = {
@@ -225,6 +241,8 @@
       runtime: null,
       readiness: null,
       datasets: [],
+      datasetCatalog: [],
+      scopeVersionId: "",
       versions: [],
       schemas: [],
       annotations: [],
@@ -262,7 +280,7 @@
       uploads: [],
       uploadMeta: "{}",
       uploadMode: "images",
-      labeledUpload: { name: "", count: 0, bytes: 0, reviewed: false, reviewer: "", confirmation: "", progress: null },
+      labeledUpload: { name: "", count: 0, bytes: 0, reviewed: true, reviewer: "上传者", confirmation: "上传者声明该数据已完成标注、逐图审核和漏标检查", progress: null },
       pipeline: {
         requirement: "",
         classes: [{ name: "", prompt: "", source: "grounding_dino", coco_class: "", model_id: "" }],
@@ -274,10 +292,14 @@
         drafting: false,
       },
       annotationId: "",
+      preparationFocus: "",
       annotationPinned: false,
       annotationQuality: null,
       annotationTasks: [],
       annotationImages: [],
+      annotationImageOffset: 0,
+      annotationImageKey: "",
+      annotationQualityKey: "",
       annotationImage: null,
       cvatSessionUrl: "",
       cvatSessionKey: "",
@@ -291,6 +313,7 @@
       metrics: [],
       epochs: [],
       trainingLogs: "",
+      trainingLogAutoFollow: true,
       trainingTaskId: "",
       trainingCharts: [],
       compareIds: [],
@@ -309,12 +332,20 @@
       agentId: "",
       agent: null,
       agentEvents: [],
+      operatorMessages: [],
+      operatorInstructions: [],
+      agentChatOpen: false,
+      agentQuestion: "",
+      agentWakeSending: false,
+      agentWakeError: "",
+      agentWakeAcceptedUntil: "",
       agentIterations: [],
       agentBudget: null,
       eventCursor: 0,
       trainForm: { params: emptyParams(), budget: {}, exportId: "", requirement: "", name: "", lockModel: false },
       trainFormKey: "",
       trainNew: false,
+      promptOptimizer: { busy: false, error: "", draft: "", notes: "", context: "", original: "", appliedText: "" },
       steps: [
         { id: "upload", name: "上传与需求" },
         { id: "annotate", name: "自动标注" },
@@ -361,6 +392,7 @@
       destroy() {
         clearTimeout(poll);
         clearTimeout(toastTimer);
+        this.resetTrainingLogFollow();
         this.clearCharts();
       },
       /** 地址只映射到固定视图，不把模型或用户文本作为路由。
@@ -400,6 +432,7 @@
         const next = this.route(hash) || { page: "projects", projectId: "" };
         ++generation;
         if (next.page !== this.page) {
+          this.resetTrainingLogFollow();
           ++detailTickets.cvat;
           this.cvatSessionUrl = this.cvatSessionKey = this.cvatAttemptKey = this.cvatError = "";
           this.cvatConnecting = false;
@@ -451,10 +484,16 @@
        * @returns {void} 清空项目范围的缓存和选择。
        */
       clearProjectState() {
+        this.resetPromptOptimization();
+        this.resetAgentChat();
+        this.resetTrainingLogFollow();
         this.cvatSessionUrl = this.cvatSessionKey = this.cvatAttemptKey = this.cvatError = "";
         this.cvatConnecting = false;
         labeledFiles = [];
-        this.labeledUpload = { name: "", count: 0, bytes: 0, reviewed: false, reviewer: "", confirmation: "", progress: null };
+        this.labeledUpload = { name: "", count: 0, bytes: 0, reviewed: true, reviewer: "上传者", confirmation: "上传者声明该数据已完成标注、逐图审核和漏标检查", progress: null };
+        this.scopeVersionId = "";
+        this.preparationFocus = "";
+        this.annotationImageOffset = 0; this.annotationImageKey = this.annotationQualityKey = "";
         ++generation;
         for (const key of Object.keys(detailTickets)) ++detailTickets[key];
         for (const key of Object.keys(lists)) this[key] = [];
@@ -476,6 +515,7 @@
           this.evaluationReport =
             null;
         this.evaluationId = "";
+        this.evaluations = []; this.modelExports = [];
         this.epochs = [];
         this.images = [];
         this.annotationImages = [];
@@ -562,6 +602,7 @@
             this.overview = values[0];
             Object.keys(lists).forEach((key, index) => {
               const fresh = values[index + 3];
+              if (key === "datasetCatalog") { this[key] = fresh; return; }
               const ids = new Set(fresh.map((x) => x.id));
               this[key] = [
                 ...fresh,
@@ -627,21 +668,18 @@
           }
         }
         if (!current()) return;
-        if (this.page === "upload") {
+        if (["upload", "annotate", "review"].includes(this.page)) {
           if (!this.datasetId) this.datasetId = this.datasets[0]?.id || "";
           if (this.datasetId) await this.chooseDataset(this.datasetId, false);
         }
         if (!current()) return;
         if (["annotate", "review"].includes(this.page)) {
           // 默认跟随当前流程自己的标注批次，手动选过其它批次后不再被轮询覆盖。
-          if (!this.annotationPinned)
-            this.annotationId =
-              this.agent?.state?.annotation_run_id ||
-              this.annotationId ||
-              this.annotations[0]?.id ||
-              "";
+          this.annotationId = this.scopeVersion?.annotation_run_id || "";
           if (this.annotationId)
             await this.chooseAnnotation(this.annotationId, false);
+          else { this.annotationQuality = null; this.annotationTasks = []; this.annotationImages = []; }
+          if (current()) this.focusPreparationSection();
         }
         if (!current()) return;
         if (["dashboard", "train", "experiments"].includes(this.page)) {
@@ -692,7 +730,108 @@
         ]);
         if (id !== this.datasetId || ticket !== detailTickets.dataset) return;
         [this.images, this.datasetTasks, this.datasetVersions] = rows;
+        const versions = this.datasetCatalog.find(row => row.id === id)?.versions || [];
+        if (!versions.some(row => row.id === this.scopeVersionId)) this.scopeVersionId = versions[0]?.id || "";
         this.imagesMore = rows[0].length === 24;
+      },
+      get scopeDataset() { return this.datasetCatalog.find(row => row.id === this.datasetId) || null; },
+      get scopeVersion() { return this.scopeDataset?.versions.find(row => row.id === this.scopeVersionId) || null; },
+      get preparationAgent() {
+        const run = this.agent;
+        if (!run || !(run.state?.workflow_mode === 'preparation' || run.state?.annotation_run_id)) return null;
+        return run.dataset_id === this.datasetId && (!this.scopeVersion || !run.dataset_version_id || run.dataset_version_id === this.scopeVersion.id) ? run : null;
+      },
+      get annotationFlowAgent() {
+        const run = this.preparationAgent;
+        return run && (!this.currentAnnotation || run.state?.annotation_run_id === this.annotationId) ? run : null;
+      },
+      get preparationTask() {
+        return this.currentAnnotation ? this.annotationTasks.find(task => task.parameters?.run_id === this.annotationId && ["queued", "running", "canceling"].includes(task.status)) || null : null;
+      },
+      /** 所有提示和主操作围绕所选数据版本，不把其它流程的状态用于当前批次。 */
+      get preparationGuide() {
+        const batch = this.currentAnnotation, run = this.annotationFlowAgent, task = this.preparationTask;
+        const exported = batch ? this.exports.find(item => item.run_id === batch.id) : null;
+        const scopedExport = !batch || batch.id === this.scopeVersion?.annotation_run_id ? this.scopeVersion?.dataset_export_id : null;
+        const exportId = exported?.id || scopedExport || null;
+        const step = batch?.status === "reviewed" || run?.phase === "reviewed_export" ? 3 : run?.phase === "annotation_validation" ? 2 : (batch?.cvat_task_id && batch.status === "pending_review") || run?.phase === "cvat_review" ? 1 : 0;
+        const base = { key: "empty", step, owner: "从这里开始", tone: "info", action: "upload", label: "去上传与需求", secondary: "", secondaryLabel: "", exportId };
+        if (exportId || batch?.status === "exported") return { ...base, key: "ready", step: 4, owner: "数据已就绪", tone: "success", title: "审核和封存已完成，可以选择这份数据训练", description: "已保存审核结果和固定的数据划分。点击后前往训练页填写需求、确认参数与预算，再开始训练。", action: "train", label: "选择这份数据训练 →" };
+        if (task?.status === "canceling" || run?.status === "canceling" || run?.stop_requested) return { ...base, key: "canceling", owner: "系统正在停止", title: "正在结束当前处理，请稍候", description: "停止完成后会保留已有标签和处理记录。此时请勿重复提交自动标注、回传或封存。", action: "", label: "" };
+        if (run?.status === "paused") return { ...base, key: "paused", owner: "流程已暂停", tone: "warning", title: "流程已暂停，恢复后继续当前步骤", description: "已有候选框和审核记录会保留。恢复时请填写操作者与说明；如果正在审核，请先保存 CVAT 中的修改。", action: "resume", label: "恢复当前流程" };
+        if (batch?.status === "stopped" || run?.status === "stopped") return { ...base, key: "stopped", owner: "流程已停止", tone: "warning", title: "这次处理已停止，已有标签保留", description: "可以继续查看已有标注与任务记录。需要重新处理时，请回到上传与需求页选择数据并创建新流程。", action: "upload", label: "返回上传与需求" };
+        const latestTask = batch ? this.annotationTasks.find(item => item.parameters?.run_id === batch.id) : null;
+        const failedTask = !run && latestTask?.status === "failed" && !task;
+        if (run?.status === "failed" || batch?.status === "failed" || failedTask) {
+          const retry = !run && ["pending_review", "reviewed"].includes(batch?.status)
+            ? ({ cvat_push: ["send", "重试发送到 CVAT"], cvat_pull: ["confirm", "修正后重新确认回传"], yolo_export: ["seal", "重试封存训练数据"] })[latestTask?.kind] : null;
+          return { ...base, key: "failed", owner: "需要处理", tone: "danger", title: "当前步骤未完成，请先查看失败原因", description: "已有标签不会被当作审核完成。先根据任务中的错误处理问题，再重试；不需要重复上传已存在的原图。", action: run?.status === "failed" ? "resume" : retry?.[0] || "tasks", label: run?.status === "failed" ? "处理问题并重试" : retry?.[1] || "查看任务与失败原因", secondary: run?.status === "failed" || retry ? "tasks" : "", secondaryLabel: "查看失败原因" };
+        }
+        if (task?.kind === "cvat_pull" || run?.phase === "annotation_validation" || (run?.phase === "cvat_review" && run.review_confirmation && ["queued", "running"].includes(run.status))) return { ...base, key: "syncing", step: 2, owner: "系统正在核验", title: "正在从 CVAT 回传并核验审核结果", description: "系统会检查每个作业的验收状态、类别与实际标注框。此时无需重复点击回传；可离开页面，稍后回来查看结果。", action: "", label: "" };
+        if (task?.kind === "yolo_export" || run?.phase === "reviewed_export") return { ...base, key: "sealing", step: 3, owner: "系统正在封存", title: "审核已通过，正在准备可训练的数据", description: "正在核验图片、标注与固定划分。完成后会显示“选择这份数据训练”，点击后再设置训练需求和预算。", action: "", label: "" };
+        if (batch?.status === "reviewed") return { ...base, key: "reviewed", step: 3, owner: "还差最后一步", title: "审核已通过，请封存为训练数据", description: this.importedAnnotation && !batch.cvat_task_id ? "来源审核记录已保留，尚需生成可供训练选择的数据。封存会保留已有标签与固定划分，不会立即启动训练。" : "回传已完成，但还没有生成可供训练选择的数据。封存会保留这次审核结果和固定划分，不会立即启动训练。", action: "seal", label: "封存为训练数据" };
+        if (task?.kind === "cvat_push" || run?.phase === "cvat_upload") return { ...base, key: "uploading", owner: "系统正在准备审核", title: "候选框已生成，正在送入 CVAT", description: "正在上传图片和候选标注。工作区准备好后会显示进入审核的按钮，现在不需要手动重复发送。", action: "", label: "" };
+        if (batch?.status === "pending_review" && batch.cvat_task_id) return { ...base, key: "review", step: 1, owner: "现在需要你审核", tone: "warning", title: "候选框已准备好，请逐图检查后回传", description: "在 CVAT 修正框、类别和漏标，保存修改，并将所有作业设为验收完成。完成后回到本页，点击“确认审核并回传”。", action: "review", label: "进入 CVAT 逐图审核", secondary: "confirm", secondaryLabel: "确认审核并回传" };
+        if (batch?.status === "pending_review") return { ...base, key: "send", owner: "下一步：准备人工审核", title: this.importedAnnotation ? "标签已导入，请发送到 CVAT 审核" : "候选框已生成，请发送到 CVAT 审核", description: "发送会创建审核任务并上传图片与标签。之后还需逐图检查，包括没有框的图片；导入或自动生成都不等于审核通过。", action: "send", label: "发送到 CVAT，准备审核" };
+        if (batch || run) return { ...base, key: "annotating", owner: "系统正在处理", title: "正在检查数据并生成待审候选框", description: run ? "系统依次检查图片、固定数据划分、生成候选框并准备审核工作区。你现在可以等待或查看进度；候选框完成后仍需人工审核。" : "正在为所选版本生成候选框。完成后请点击“发送到 CVAT，准备审核”，再逐图检查；不会自动批准候选框。", action: "tasks", label: "查看处理进度" };
+        return { ...base, title: "先选择数据，再开始自动标注或标签审核", description: "原图：在上传与需求页填写检测目标并开始自动标注。已有标签：上传标注数据后，根据是否已完成审核进入相应步骤。" };
+      },
+      get preparationMilestones() {
+        const step = this.preparationGuide.step;
+        return [
+          { title: this.importedAnnotation ? "导入标签" : "生成候选框", owner: "系统处理" },
+          { title: this.importedAnnotation && !this.currentAnnotation?.cvat_task_id && step >= 3 ? "继承来源审核" : "在 CVAT 逐图审核", owner: "你来检查" },
+          { title: this.importedAnnotation && !this.currentAnnotation?.cvat_task_id && step >= 3 ? "核验已有标签" : "回传并核验", owner: "你确认，系统核验" },
+          { title: "封存为训练数据", owner: "完成后手动开训" },
+        ].map((item, index) => ({ ...item, state: step > index ? "done" : step === index ? "current" : "todo" }));
+      },
+      async preparationAction(action) {
+        if (this.busy) return;
+        if (action === "upload") return this.navigate("upload");
+        if (action === "train") return this.preparationGuide.exportId ? this.useReadyDataset(this.preparationGuide.exportId) : this.navigate("train");
+        if (action === "resume") return this.show("resumeAgent");
+        if (action === "confirm") return this.show(this.annotationFlowAgent?.phase === "cvat_review" && this.annotationFlowAgent.status === "needs_review" ? "resumeAgent" : "sync");
+        if (action === "send") return this.action(`/annotation-runs/${this.annotationId}/cvat`, "已提交图片与标签，请等待审核工作区准备完成");
+        if (action === "seal") return this.action(`/annotation-runs/${this.annotationId}/exports`, "已提交数据封存，完成后请前往训练页选择数据");
+        if (action === "review") {
+          if (this.page !== "review") { this.preparationFocus = "cvat-review"; return this.navigate("review"); }
+          return this.read(this.openCvatReview());
+        }
+        if (action === "tasks") {
+          this.preparationFocus = "annotation-tasks";
+          if (this.page !== "annotate") return this.navigate("annotate");
+          this.focusPreparationSection();
+        }
+      },
+      focusPreparationSection() {
+        if (!this.preparationFocus) return;
+        const id = this.preparationFocus;
+        this.preparationFocus = "";
+        this.$nextTick(() => {
+          const target = document.getElementById(id) || (id === "cvat-review" ? document.getElementById("cvat-connection") : null);
+          target?.scrollIntoView({ block: "start", behavior: window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
+        });
+      },
+      sourceName(source) { return ({raw_images:"原图自动标注",labeled_upload:"上传标签 · 待审核",reviewed_upload:"上传已审核数据"})[source] || "原图"; },
+      dataState(state) { return ({ready:"可直接训练",reviewed:"审核完成 · 待准备训练数据",needs_review:"等待人工审核",unlabeled:"等待标注",annotating:"正在标注",stopped:"已停止"})[state] || "等待上传"; },
+      async changeDataScope() {
+        this.annotationId = ""; this.annotationPinned = true;
+        this.annotationTasks = []; this.annotationImages = []; this.preparationFocus = "";
+        this.annotationImageOffset = 0; this.annotationImageKey = this.annotationQualityKey = "";
+        this.cvatSessionUrl = this.cvatSessionKey = this.cvatAttemptKey = this.cvatError = "";
+        await this.chooseDataset(this.datasetId);
+        if (this.scopeVersion?.annotation_run_id) await this.chooseAnnotation(this.scopeVersion.annotation_run_id);
+      },
+      async changeVersionScope() {
+        this.annotationTasks = []; this.annotationImages = []; this.preparationFocus = "";
+        this.annotationImageOffset = 0; this.annotationImageKey = this.annotationQualityKey = "";
+        this.cvatSessionUrl = this.cvatSessionKey = this.cvatAttemptKey = this.cvatError = "";
+        this.annotationId = this.scopeVersion?.annotation_run_id || "";
+        this.annotationQuality = null; this.annotationTasks = [];
+        if (this.annotationId) await this.chooseAnnotation(this.annotationId);
+      },
+      useReadyDataset(exportId) {
+        this.newTraining(); this.trainForm.exportId = exportId; this.navigate('train');
       },
       /** 读取逐类审核与漏标确认，不把候选置信度当作准确率。
        * @param {string} id 标注批次。
@@ -709,14 +848,18 @@
         }
         this.annotationId = id;
         const run = await api(`/annotation-runs/${id}`);
+        const qualityKey = `${id}:${run.status}:${run.processed}`;
+        const imageKey = `${run.version_id}:${this.annotationImageOffset}`;
         const [quality, images, tasks] = await Promise.all([
-          api(`/annotation-runs/${id}/quality`),
-          api(`/dataset-versions/${run.version_id}/images?limit=24`),
+          this.annotationQualityKey === qualityKey ? Promise.resolve(this.annotationQuality) : api(`/annotation-runs/${id}/quality`),
+          this.annotationImageKey === imageKey ? Promise.resolve(this.annotationImages) : api(`/dataset-versions/${run.version_id}/images?limit=24&offset=${this.annotationImageOffset}`),
           api(`/annotation-runs/${id}/tasks?limit=20`),
         ]);
         if (id !== this.annotationId || ticket !== detailTickets.annotation)
           return;
         this.annotationQuality = quality;
+        this.annotationQualityKey = qualityKey;
+        this.annotationImageKey = imageKey;
         this.annotationImages = images;
         this.annotationTasks = tasks;
         const index = this.annotations.findIndex((x) => x.id === id);
@@ -797,7 +940,9 @@
           if (!this.annotations.some(run => run.id === runId)) return;
           await this.chooseAnnotation(runId);
         }
-        this.$nextTick(() => document.getElementById("cvat-review")?.scrollIntoView({ block: "start", behavior: "smooth" }));
+        if (!this.cvatEmbedUrl) await this.connectCvat();
+        this.preparationFocus = this.cvatEmbedUrl ? "cvat-review" : "cvat-connection";
+        this.focusPreparationSection();
       },
       /** 实验曲线来自全部实际记录，恢复任务不伪造连续点。
        * @param {string} id 已绑定审核工件的实验。
@@ -808,6 +953,7 @@
         if (pin) this.experimentPinned = true;
         const ticket = ++detailTickets.experiment;
         if (this.experiment?.id !== id) {
+          this.resetTrainingLogFollow();
           this.experiment = null;
           this.trainingTasks = [];
           this.trainingTaskId = "";
@@ -849,8 +995,13 @@
         this.metrics = rows;
         this.epochs = epochRows(rows);
         this.evaluations = evaluations;
+        if (this.trainingTaskId !== taskId) this.resetTrainingLogFollow();
         this.trainingTaskId = taskId;
         this.trainingLogs = logs;
+        const logView = trainingLogView;
+        this.$nextTick(() => {
+          if (logView === trainingLogView) this.scrollTrainingLog();
+        });
         const valid = evaluations.find(
           (x) => x.status === "completed" && !x.invalidated_reason,
         );
@@ -871,6 +1022,56 @@
           await this.$nextTick(() => this.plotTraining());
         if (this.page === "experiments" && this.evaluationId)
           await this.chooseEvaluation(this.evaluationId, false);
+      },
+      /** 日志自动跟随仅响应真实输入意图，程序滚动和内容更新不重置空闲计时。 */
+      scrollTrainingLog() {
+        if (!this.trainingLogAutoFollow || this.page !== "train" || document.hidden) return;
+        const log = this.$refs.trainingLog;
+        if (log?.clientHeight) log.scrollTop = log.scrollHeight;
+      },
+      resetTrainingLogFollow() {
+        ++trainingLogView;
+        clearTimeout(trainingLogResumeTimer);
+        trainingLogResumeTimer = null;
+        trainingLogPointer = null;
+        trainingLogTouching = false;
+        this.trainingLogAutoFollow = true;
+      },
+      pauseTrainingLogFollow() {
+        clearTimeout(trainingLogResumeTimer);
+        trainingLogResumeTimer = null;
+        this.trainingLogAutoFollow = false;
+        if (trainingLogPointer !== null || trainingLogTouching) return;
+        const view = trainingLogView;
+        trainingLogResumeTimer = setTimeout(() => {
+          trainingLogResumeTimer = null;
+          if (view !== trainingLogView) return;
+          this.trainingLogAutoFollow = true;
+          this.$nextTick(() => {
+            if (view === trainingLogView) this.scrollTrainingLog();
+          });
+        }, 10_000);
+      },
+      startTrainingLogInteraction(event) {
+        trainingLogPointer = event.pointerId;
+        this.pauseTrainingLogFollow();
+      },
+      endTrainingLogInteraction(event) {
+        if (trainingLogPointer === null || (event && event.pointerId !== trainingLogPointer)) return;
+        trainingLogPointer = null;
+        this.pauseTrainingLogFollow();
+      },
+      startTrainingLogTouch() {
+        trainingLogTouching = true;
+        this.pauseTrainingLogFollow();
+      },
+      endTrainingLogTouch(event) {
+        if (!trainingLogTouching || event.touches.length) return;
+        trainingLogTouching = false;
+        this.pauseTrainingLogFollow();
+      },
+      trainingLogKeydown(event) {
+        if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key)) this.pauseTrainingLogFollow();
       },
       /** 评估报告明确携带阈值和样本支持量，失效报告不可用于比较。
        * @param {string} id 有效完成评估。
@@ -929,32 +1130,108 @@
       async chooseAgent(id, reset = true) {
         const ticket = ++detailTickets.agent;
         if (this.agent?.id !== id) {
+          this.resetAgentChat();
           this.agent = null;
           this.agentBudget = null;
           this.agentIterations = [];
-          this.annotationPinned = this.experimentPinned = this.trainNew = false;
-          this.trainFormKey = "";
-          if (this.page === "train") this.resetTrainForm("new");
+          this.annotationPinned = this.experimentPinned = false;
+          if (!this.trainNew) {
+            this.trainFormKey = "";
+            if (this.page === "train") this.resetTrainForm("new");
+          }
         }
         if (reset || id !== this.agentId) {
           this.eventCursor = 0;
           this.agentEvents = [];
         }
         this.agentId = id;
-        const [run, iterations, budget, events] = await Promise.all([
+        const [run, iterations, budget, events, messages, instructions] = await Promise.all([
           api(`/agent-runs/${id}`),
           api(`/agent-runs/${id}/iterations`),
           api(`/agent-runs/${id}/budget`),
           api(`/agent-runs/${id}/events?after_id=${this.eventCursor}&limit=500`),
+          api(`/agent-runs/${id}/operator-messages`),
+          api(`/agent-runs/${id}/operator-instructions`),
         ]);
         if (id !== this.agentId || ticket !== detailTickets.agent) return;
+        const thread = this.$refs.agentChatThread;
+        const follow = !thread || thread.scrollHeight - thread.scrollTop - thread.clientHeight < 64;
+        const messageKey = rows => rows.map(row => `${row.request_id}:${row.answered_at || ""}`).join("|");
+        const messagesChanged = messageKey(messages) !== messageKey(this.operatorMessages);
         this.agent = run;
+        this.operatorMessages = messages;
+        this.operatorInstructions = instructions;
         this.agentIterations = iterations;
         this.agentBudget = budget;
         const ids = new Set(this.agentEvents.map((x) => x.id));
         this.agentEvents.push(...events.filter((x) => !ids.has(x.id)));
         if (events.length) this.eventCursor = events.at(-1).id;
+        if (this.agentChatOpen && follow && messagesChanged) this.$nextTick(() => this.scrollAgentChat());
         if (this.page === "train") this.syncTrainingForm();
+      },
+      resetAgentChat() {
+        ++agentChatTicket;
+        this.operatorMessages = [];
+        this.operatorInstructions = [];
+        this.agentChatOpen = false;
+        this.agentQuestion = this.agentWakeError = this.agentWakeAcceptedUntil = "";
+        this.agentWakeSending = false;
+      },
+      openAgentChat() {
+        this.agentChatOpen = true;
+        this.$nextTick(() => {
+          this.scrollAgentChat();
+          if (this.canWakeAgent) this.$refs.agentQuestion?.focus();
+          else this.$refs.agentChatHeading?.focus();
+        });
+      },
+      async revokeOperatorInstruction(item) {
+        if (this.busy || !this.agentId) return;
+        const id = this.agentId, project = this.projectId;
+        this.busy = true;
+        this.agentWakeError = "";
+        try {
+          await api(`/agent-runs/${id}/operator-instructions/${encodeURIComponent(item.key)}/revoke`, {
+            method: "POST", body: { instruction_id: item.instruction_id },
+          });
+          if (id !== this.agentId || project !== this.projectId) return;
+          const instructions = await api(`/agent-runs/${id}/operator-instructions`);
+          if (id !== this.agentId || project !== this.projectId) return;
+          this.operatorInstructions = instructions;
+          this.toast("持续指令已撤销，将从下一次决策起生效");
+        } catch (error) {
+          if (id === this.agentId && project === this.projectId) this.agentWakeError = error.message;
+        } finally { this.busy = false; }
+      },
+      scrollAgentChat() {
+        const thread = this.$refs.agentChatThread;
+        thread?.scrollTo({ top: thread.scrollHeight, behavior: "auto" });
+      },
+      closeAgentChat() {
+        this.agentChatOpen = false;
+        this.$nextTick(() => this.$refs.agentChatToggle?.focus());
+      },
+      async wakeAgent(event) {
+        if (event?.isComposing || this.busy || this.agentWakeSending || !this.canWakeAgent) return;
+        const id = this.agentId, project = this.projectId;
+        const ticket = agentChatTicket;
+        const question = this.agentQuestion.trim();
+        const until = this.agent.state.waiting.until;
+        this.agentWakeSending = true;
+        this.agentWakeError = "";
+        try {
+          await api(`/agent-runs/${id}/wake`, { method: "POST", body: { question, sleep_until: until } });
+          if (ticket !== agentChatTicket || id !== this.agentId || project !== this.projectId) return;
+          this.agentWakeAcceptedUntil = until;
+          if (this.agentQuestion.trim() === question) this.agentQuestion = "";
+          this.toast(question ? "已请求唤醒，问题已交给 Agent" : "已请求立即唤醒 Agent");
+          try { await this.chooseAgent(id, false); }
+          catch (_) { this.agentWakeError = "唤醒请求已提交，暂未刷新到最新状态，请稍后刷新。"; }
+        } catch (error) {
+          if (ticket === agentChatTicket && id === this.agentId && project === this.projectId) this.agentWakeError = error.message;
+        } finally {
+          if (ticket === agentChatTicket && id === this.agentId && project === this.projectId) this.agentWakeSending = false;
+        }
       },
       /** 只在操作者点击时读取发布证据，不自动批准生产模型。
        * @param {string} id 候选模型。
@@ -1192,6 +1469,7 @@
           try {
             const task = await api(`/dataset-tasks/${item.id}`);
             item.phase = task.status; item.processed = task.processed; item.taskTotal = task.total;
+            if (task.status === 'completed' && task.result?.version_id && item.datasetId === this.datasetId) this.scopeVersionId = task.result.version_id;
             item.error = task.error || "";
           } catch (error) { item.error = error.message; }
         }));
@@ -1200,7 +1478,7 @@
         return ({ preparing: "正在登记上传", uploading: `正在传输 · ${item.percent}%`, receiving: "传输 100% · 服务器正在接收", canceling: "正在取消上传", queued: "文件已接收 · 等待后台检查", running: `后台检查 · ${item.processed} / ${item.taskTotal ?? item.count}`, completed: "导入完成", stopped: "上传已取消", failed: "上传失败", unknown: "接收状态待确认" })[item.phase] || this.status(item.phase);
       },
       get datasetUploading() {
-        return this.uploads.some(item => item.datasetId === this.datasetId && ["preparing", "uploading", "receiving", "canceling", "queued", "running", "unknown"].includes(item.phase)) || this.datasetTasks.some(item => item.dataset_id === this.datasetId && ["uploading", "queued", "running"].includes(item.status));
+        return this.uploads.some(item => item.datasetId === this.datasetId && ["preparing", "uploading", "receiving", "canceling", "queued", "running", "unknown"].includes(item.phase)) || this.datasetTasks.some(item => item.dataset_id === this.datasetId && ["uploading", "queued", "running", "canceling"].includes(item.status));
       },
       datasetAnnotation(versionId) {
         return this.annotations.filter(run => run.version_id === versionId && ['pending_review','reviewed','exported'].includes(run.status))
@@ -1210,6 +1488,7 @@
         const run = this.datasetAnnotation(versionId);
         if (!run || this.busy) return;
         this.annotationId = run.id;
+        this.scopeVersionId = versionId;
         this.annotationPinned = true;
         this.navigate('review');
       },
@@ -1270,9 +1549,8 @@
        * @returns {void} 无。
        */
       resetTrainForm(key) {
-        const policy = this.setupMode
-          ? this.agent.policy
-          : this.overview?.configuration?.agent_defaults || {};
+        this.resetPromptOptimization();
+        const policy = this.overview?.configuration?.agent_defaults || {};
         this.trainForm = {
           params: { ...emptyParams(), ...Object.fromEntries(this.trainingParameterGroups.flatMap(group => group.fields.map(field => [field.name, ""]))) },
           budget: {
@@ -1284,7 +1562,7 @@
             minimum_improvement: policy.minimum_improvement ?? 0.001,
             purpose: policy.purpose ?? "model_optimization",
           },
-          exportId: this.exports[0]?.id || "",
+          exportId: "",
           requirement: this.agent?.requirement || "",
           name: "",
           lockModel: policy.allowed_models?.length === 1,
@@ -1294,7 +1572,7 @@
       },
       syncTrainingForm() {
         if (this.showTrainForm) {
-          const key = this.setupMode ? `setup:${this.agent.id}` : "new";
+          const key = "new";
           if (this.trainFormKey !== key) this.resetTrainForm(key);
         } else if (this.trainingReadback) this.syncAgentTrainingForm();
       },
@@ -1308,6 +1586,7 @@
         const iteration = this.latestTrainingIteration;
         const key = `agent:${this.agent.id}:${iteration?.experiment_id || "planning"}`;
         if (this.trainFormKey === key) return;
+        this.resetPromptOptimization();
         const parameters = iteration?.plan?.parameters || Object.fromEntries(
           (this.agent.state?.operator_fields || []).map(field => [field, this.agent.initial_parameters?.[field]]),
         );
@@ -1352,7 +1631,97 @@
         }
         return result;
       },
-      /** 人审后确认开始训练，或从已审数据新建训练流程。
+      /** 优化建议与训练创建共享同一份表单约束，未填写的参数不补默认值。 */
+      trainingPolicy(params) {
+        const budget = this.trainForm.budget;
+        const policy = {
+          max_experiments: Number(budget.max_experiments),
+          max_training_hours: Number(budget.max_training_hours),
+          max_epochs_per_experiment: Number(budget.max_epochs_per_experiment),
+          max_imgsz: Number(budget.max_imgsz),
+          stagnation_rounds: Number(budget.stagnation_rounds),
+          minimum_improvement: Number(budget.minimum_improvement),
+          purpose: budget.purpose,
+          allowed_models: this.trainForm.lockModel ? [params.model] : (this.overview?.configuration?.agent_defaults?.allowed_models || ["yolo26n.pt", "yolo26s.pt"]),
+        };
+        if (this.trainForm.lockModel && !params.model) throw new Error("锁定模型前，请先选择一个基座模型");
+        if (params.model && !policy.allowed_models.includes(params.model)) throw new Error("所选模型不在本次允许范围内，请锁定该模型或选择允许的模型");
+        return policy;
+      },
+      trainingPromptInput() {
+        const params = this.pinnedParams();
+        return {
+          project_id: this.projectId,
+          requirement: this.trainForm.requirement.trim(),
+          dataset_export_id: this.trainForm.exportId || null,
+          initial_parameters: params,
+          policy: this.trainingPolicy(params),
+        };
+      },
+      resetPromptOptimization() {
+        ++promptOptimizationTicket;
+        promptOptimizationRequest?.abort();
+        promptOptimizationRequest = null;
+        this.promptOptimizer = { busy: false, error: "", draft: "", notes: "", context: "", original: "", appliedText: "" };
+      },
+      /** 仅在用户点击时请求建议；迟到响应不能跨项目或覆盖新表单。 */
+      async optimizeTrainingPrompt() {
+        if (this.busy || this.promptOptimizer.busy || !this.showTrainForm || !this.llmReady) return;
+        let body;
+        try {
+          body = this.trainingPromptInput();
+          if (body.requirement.length < 4) throw new Error("请先填写至少 4 个字的训练需求");
+        } catch (error) {
+          this.promptOptimizer.error = error.message;
+          return;
+        }
+        this.resetPromptOptimization();
+        const ticket = promptOptimizationTicket;
+        promptOptimizationRequest = new AbortController();
+        this.promptOptimizer.busy = true;
+        this.promptOptimizer.original = this.trainForm.requirement;
+        this.promptOptimizer.context = JSON.stringify(body);
+        try {
+          const draft = await api("/training-prompts/optimize", { method: "POST", body, signal: promptOptimizationRequest.signal });
+          if (ticket !== promptOptimizationTicket) return;
+          this.promptOptimizer.draft = draft.requirement;
+          this.promptOptimizer.notes = draft.notes || "";
+        } catch (error) {
+          if (ticket === promptOptimizationTicket && error.name !== "AbortError") this.promptOptimizer.error = error.message;
+        } finally {
+          if (ticket === promptOptimizationTicket) {
+            this.promptOptimizer.busy = false;
+            promptOptimizationRequest = null;
+          }
+        }
+      },
+      get promptOptimizationStale() {
+        if (!this.promptOptimizer.context) return false;
+        try { return this.promptOptimizer.context !== JSON.stringify(this.trainingPromptInput()); }
+        catch (_) { return true; }
+      },
+      applyTrainingPrompt() {
+        if (this.busy || !this.showTrainForm || this.promptOptimizationStale) return;
+        const text = this.promptOptimizer.draft.trim();
+        if (text.length < 4 || text.length > 2000) {
+          this.promptOptimizer.error = "优化后的需求需为 4–2000 个字符";
+          return;
+        }
+        this.trainForm.requirement = text;
+        this.promptOptimizer.appliedText = text;
+        this.promptOptimizer.error = "";
+        this.toast("已采用优化建议，仍可继续编辑需求");
+        this.$nextTick(() => this.$refs.trainingRequirement?.focus());
+      },
+      restoreTrainingPrompt() {
+        if (this.busy || !this.showTrainForm || this.trainForm.requirement !== this.promptOptimizer.appliedText) return;
+        const original = this.promptOptimizer.original;
+        this.resetPromptOptimization();
+        this.trainForm.requirement = original;
+        this.toast("已恢复优化前的原文");
+        this.$nextTick(() => this.$refs.trainingRequirement?.focus());
+      },
+      /** 明确选择已审数据后创建独立训练流程。
        * @returns {Promise<void>} 请求结束。
        */
       async startTraining() {
@@ -1361,45 +1730,27 @@
         this.inlineError = "";
         try {
           const params = this.pinnedParams();
-          const budget = this.trainForm.budget;
-          const policy = {
-            max_experiments: Number(budget.max_experiments),
-            max_training_hours: Number(budget.max_training_hours),
-            max_epochs_per_experiment: Number(budget.max_epochs_per_experiment),
-            max_imgsz: Number(budget.max_imgsz),
-            stagnation_rounds: Number(budget.stagnation_rounds),
-            minimum_improvement: Number(budget.minimum_improvement),
-            purpose: budget.purpose,
-            allowed_models: this.trainForm.lockModel ? [params.model] : (this.setupMode ? this.agent.policy.allowed_models : this.overview?.configuration?.agent_defaults?.allowed_models || ["yolo26n.pt", "yolo26s.pt"]),
-          };
-          if (this.trainForm.lockModel && !params.model) throw new Error("锁定模型前，请先选择一个基座模型");
-          if (params.model && !policy.allowed_models.includes(params.model)) throw new Error("所选模型不在本次允许范围内，请锁定该模型或选择允许的模型");
+          const policy = this.trainingPolicy(params);
           if (params.epochs > policy.max_epochs_per_experiment)
             throw new Error("首轮 epochs 超过单实验上限");
           if (params.imgsz > policy.max_imgsz)
             throw new Error("首轮输入尺寸超过上限");
-          if (this.setupMode) {
-            await api(`/agent-runs/${this.agent.id}/training-setup`, {
-              method: "POST",
-              body: { initial_parameters: params, policy },
-            });
-            this.toast("已开始训练，Agent 会先规划首轮实验");
-          } else {
-            const run = await api("/agent-runs", {
-              method: "POST",
-              body: {
-                dataset_export_id: this.trainForm.exportId,
-                name: this.trainForm.name.trim() || "自主训练",
-                requirement: this.trainForm.requirement.trim(),
-                policy,
-                initial_parameters: params,
-              },
-            });
-            this.agentId = run.id;
-            this.agentEvents = [];
-            this.eventCursor = 0;
-            this.toast("训练流程已创建，预算已冻结");
-          }
+          if (!this.trainForm.exportId) throw new Error("请选择一份已完成标注和审核的训练数据");
+          this.resetPromptOptimization();
+          const run = await api("/agent-runs", {
+            method: "POST",
+            body: {
+              dataset_export_id: this.trainForm.exportId,
+              name: this.trainForm.name.trim() || "自主训练",
+              requirement: this.trainForm.requirement.trim(),
+              policy,
+              initial_parameters: params,
+            },
+          });
+          this.agentId = run.id;
+          this.agentEvents = [];
+          this.eventCursor = 0;
+          this.toast("训练流程已创建，预算已冻结");
           this.trainNew = false;
           this.trainFormKey = "";
           this.busy = false;
@@ -1475,14 +1826,9 @@
         this.busy = true;
         this.inlineError = "";
         try {
-          const rows = [];
-          for (let offset = 0; ; offset += 200) {
-            const page = await api(`/datasets?limit=200&offset=${offset}`);
-            rows.push(...page);
-            if (page.length < 200) break;
-          }
+          const rows = await api('/workspace/datasets');
           if (project !== this.projectId) return;
-          this.copySources = rows.filter(row => row.project_id !== project);
+          this.copySources = rows.filter(row => row.project_id !== project && row.versions.some(version => ['ready','reviewed'].includes(version.status)));
           ++this.copySourceTicket;
           this.copyVersions = [];
           this.copyVersionsLoading = false;
@@ -1501,14 +1847,9 @@
         this.formError = "";
         this.copyVersionsLoading = true;
         try {
-          const rows = [];
-          for (let offset = 0; id; offset += 200) {
-            const page = await api(`/datasets/${id}/versions?limit=200&offset=${offset}`);
-            rows.push(...page);
-            if (page.length < 200) break;
-          }
+          const rows = source?.versions || [];
           if (ticket !== this.copySourceTicket || this.modal !== "copyDataset") return;
-          this.copyVersions = rows.filter(row => row.sealed);
+          this.copyVersions = rows.filter(row => ['ready','reviewed'].includes(row.status));
           this.form.version_id = this.copyVersions[0]?.id || "";
         } catch (error) { if (ticket === this.copySourceTicket) this.formError = error.message; }
         finally { if (ticket === this.copySourceTicket) this.copyVersionsLoading = false; }
@@ -1658,7 +1999,7 @@
                 },
               },
             );
-            message = "已提交审核回传，服务会再次检查 CVAT 验收状态";
+            message = "已提交审核回传，正在核验 CVAT 作业；成功后请封存为训练数据";
           }
           if (this.modal === "experiment") {
             result = await api("/experiments", {
@@ -1691,7 +2032,7 @@
             });
             message =
               this.agent.phase === "cvat_review"
-                ? "已确认审核，正在回传并封存训练数据"
+                ? "已提交审核回传，核验成功后自动封存；完成后请到训练页手动开始训练"
                 : "已提交人工处理，流程沿原检查点继续";
           }
           if (this.modal === "publish") {
@@ -2172,13 +2513,22 @@
        * @returns {string} done、current、gate、todo、skipped 或 failed。
        */
       stepState(step) {
+        if (['upload','annotate','review'].includes(this.page)) {
+          const version = this.scopeVersion;
+          if (step === 1) return this.scopeDataset?.image_count ? 'done' : 'current';
+          if (step === 2) return version?.source && version.source !== 'raw_images' ? 'skipped' : version?.annotation_run_id && ['needs_review','reviewed','ready'].includes(version.status) ? 'done' : this.page === 'annotate' ? 'current' : 'todo';
+          if (step === 3) return ['reviewed','ready'].includes(version?.status) ? 'done' : version?.status === 'needs_review' ? 'gate' : version?.status === 'stopped' ? 'stopped' : 'todo';
+          return 'todo';
+        }
         const run = this.agent;
         if (!run) return step === 1 ? "current" : "todo";
+        if (run.state?.preparation_complete && step >= 4) return "todo";
         if (this.reusedExport && step <= 3) return "skipped";
         const at = this.flowStep;
         if (step < at) return "done";
         if (step > at) return "todo";
         if (run.status === "failed") return "failed";
+        if (run.status === "stopped") return "stopped";
         if (run.status === "needs_review") return "gate";
         return "current";
       },
@@ -2188,6 +2538,7 @@
        */
       stepText(step) {
         const state = this.stepState(step);
+        if (state === 'skipped' && ['upload','annotate','review'].includes(this.page)) return '使用上传标签';
         if (step === 5 && state === "current" && ["completed", "stopped"].includes(this.agent?.status))
           return "可以导出";
         return {
@@ -2197,6 +2548,7 @@
           todo: "未开始",
           skipped: "复用已审数据",
           failed: "失败",
+          stopped: "已停止",
         }[state];
       },
       /** 流程条的样式类：当前与等待人工的一步带检测框角标。
@@ -2235,6 +2587,15 @@
         if (!detail) return "";
         const count = `${detail.estimated ? "约 " : ""}${detail.completed_images} / ${detail.total_images} 张`;
         const stages = {
+          annotation_queued: detail.independent_queue ? "等待自动标注 Worker 接单；与训练使用独立队列" : "仍在旧计算队列排队；这条任务保留原队列位置",
+          loading_annotation_models: `正在加载自动标注模型 · ${detail.device || "执行设备待确认"}`,
+          annotating_images: `正在自动标注 · ${count} · ${detail.device || "执行设备待确认"}`,
+          preparing_source: "正在读取数据包结构与来源配置",
+          extracting_archive: `正在解包 · ${detail.completed_files||0} / ${detail.total_files||0} 个文件`,
+          normalizing_labels: `正在适配图片编码并检查标签 · 已处理 ${detail.completed_images||0} 张`,
+          parsing_labels: `正在解析 YOLO 类别与标签 · 共 ${detail.total_images||0} 张`,
+          checking_images: `检查图片编码、预览与标注 · ${count}`,
+          copying_images: `复制已审核图片与标签 · ${count}`,
           preparing_images: `准备 CVAT 审核图片 · ${count}${detail.prepared_bytes ? ` · 已生成 ${this.bytes(detail.prepared_bytes)}` : ""}`,
           preparing_or_uploading: "图片准备即将完成，等待 CVAT 接收；尚未完成上传",
           connecting_cvat: "审核图片已准备完成，正在连接 CVAT",
@@ -2250,10 +2611,23 @@
           export_hashing: `正在校验工件指纹 · ${detail.completed_files || 0} / ${detail.total_files || 0} 个文件`,
           export_archiving: `正在压缩可下载数据包${detail.archive_bytes ? ` · 已写入 ${this.bytes(detail.archive_bytes)}` : ""}`,
           export_verifying_archive: "正在校验数据包并完成封存",
+          export_ready: "训练数据已准备完成，等待你选择并开始训练",
+          analyzing_dataset: "正在检查重复图片与采集分组",
+          validating_version: `正在核验并封存数据版本 · ${count}`,
+          writing_version: "正在保存版本清单与固定划分",
         };
         const text = stages[detail.stage] || "";
         const elapsed = detail.elapsed_seconds;
         return text && elapsed != null ? `${text} · 已用时 ${Math.floor(elapsed / 60)} 分 ${elapsed % 60} 秒` : text;
+      },
+      evaluationProgress(task) {
+        const progress = task.summary?.progress;
+        if (!progress) return this.status(task.status);
+        return ({verifying_inputs:'核验已审数据与权重',validating:`验证图片 · ${progress.completed_batches||0} / ${progress.total_batches||'—'} 个批次`,analyzing_errors:'定位误检和漏检，生成结果图'})[progress.stage] || this.status(task.status);
+      },
+      modelExportProgress(task) {
+        if (task.status === 'completed') return task.verification?.runtime ? `${task.verification.runtime} 加载通过` : '已完成';
+        return task.error || ({verifying_weights:'核验原始权重',converting:'转换部署格式',verifying_runtime:'验证部署文件可加载与推理'})[task.verification?.progress] || this.status(task.status);
       },
       /** 部署格式的显示名。
        * @param {string} format 格式标识。
@@ -2281,11 +2655,35 @@
       /** 工具调用的关键参数，理由单独展示。
        * @param {string} tool 工具名。
        * @param {object} args 调用参数。
+       * @param {string|object} result 已执行工具返回的结果。
        * @returns {string} 摘要。
        */
-      toolDetail(tool, args) {
-        if (tool === "start_experiment")
-          return this.paramText(args.parameters) || "沿用上一轮参数";
+      toolDetail(tool, args, result) {
+        if (tool === "Skill" || tool === "SkillRead") return [args.skill_name, args.file_name].filter(Boolean).join(" · ");
+        if (tool === "answer_operator") return args.answer || "";
+        if (tool === "inspect_training_parameters") return (args.names || []).join("、") || "查询参数范围与来源";
+        if (tool === "read_dataset_examples") return [args.split === "val" ? "验证集" : "训练集", args.class_name, (args.image_ids || []).join("、")].filter(Boolean).join(" · ");
+        if (tool === "read_validation_errors") return [args.class_name || "全部类别", args.small_only ? "小目标漏检" : ({ fn: "漏检", fp: "误检", any: "漏检与误检" })[args.error_kind || "fn"], args.image_id].filter(Boolean).join(" · ");
+        if (tool === "compare_experiments") return [args.baseline_experiment_id, args.candidate_experiment_id].map((id) => this.entityLabel("experiment", id)).join(" → ");
+        if (tool === "preview_experiment") {
+          let status = "";
+          try {
+            const outcome = typeof result === "string" ? JSON.parse(result) : result;
+            status = outcome?.valid === false ? "配置需修改" : outcome?.can_start === true ? "预检通过" : outcome?.valid === true ? "配置有效，等待开训条件" : "";
+          } catch (_) {}
+          return [status, this.paramText(args.parameters)].filter(Boolean).join(" · ") || "检查参数、数据与预算";
+        }
+        if (tool === "get_experiment") return [this.entityLabel("experiment", args.experiment_id), ({ overview: "概览", parameters: "参数", curve: "逐轮指标", evaluation: "验证结果", training: "训练尝试" })[args.section || "overview"]].join(" · ");
+        if (tool === "start_experiment") {
+          const changes = this.paramText(args.parameters);
+          if (changes) return changes;
+          try {
+            const outcome = typeof result === "string" ? JSON.parse(result) : result;
+            if (outcome?.iteration === 0) return "首轮采用平台默认值及已填写参数";
+            if (outcome?.iteration > 0) return args.parent_experiment_id ? "沿用所选父实验参数" : "沿用上一轮参数";
+          } catch (_) {}
+          return "未显式调整参数，实际配置见实验详情";
+        }
         if (tool === "read_chart")
           return `${args.source === "training" ? "训练" : "评估"} · ${(args.charts || []).map((x) => chartNames[x] || x).join("、")}`;
         if (tool === "sleep") return `${args.minutes} 分钟`;
@@ -2331,11 +2729,17 @@
             created: "创建流程",
             model_decision: "模型决策",
             model_response_received: "模型响应",
+            context_compacted: "已压缩早期对话",
+            context_window_rejected: "调整上下文窗口",
+            operator_instruction_set: "保存持续指令",
+            operator_instruction_revoked: "撤销持续指令",
             woke: "醒来",
             validation_observed: "验证结论",
             experiment_created: "新建实验",
             experiment_abandoned: "放弃实验",
             checkpoint_resumed: "从检查点继续",
+            wake_requested: "手动唤醒 Agent",
+            operator_answer: "Agent 回答",
             training_stop_requested: "请求暂停训练",
             stagnation_detected: "停滞停止",
             human_review_requested: "请求人工处理",
@@ -2351,7 +2755,9 @@
       },
       eventDetail(event) {
         const payload = event.payload || {};
-        if (event.event_type === "tool_call") return [this.toolDetail(payload.tool, payload.arguments || {}), payload.arguments?.reason, payload.ok === false ? "执行被拒绝，展开原始记录查看原因" : ""].filter(Boolean).join("\n");
+        if (event.event_type === "wake_requested") return payload.question || "未附带问题，立即检查最新训练状态";
+        if (event.event_type === "operator_answer") return payload.answer;
+        if (event.event_type === "tool_call") return [this.toolDetail(payload.tool, payload.arguments || {}, payload.result), payload.arguments?.reason, payload.ok === false ? "执行被拒绝，展开原始记录查看原因" : ""].filter(Boolean).join("\n");
         if (event.event_type === "validation_observed") return `第 ${payload.iteration + 1} 轮验证完成：mAP50–95 ${this.metric(payload.summary?.map50_95)}，mAP50 ${this.metric(payload.summary?.map50)}`;
         if (event.event_type === "sealed") return payload.best_model ? this.entityLabel("model", payload.best_model.model_id) : "报告已封存，没有有效候选模型";
         return payload.content || payload.reason || payload.message || (payload.experiment_id ? this.entityLabel("experiment", payload.experiment_id) : "");
@@ -2383,6 +2789,7 @@
         if (this.page === "projects") return "选择一个项目，进入它的数据、标注、训练和模型工作区";
         if (this.page === "overview") return "汇总所有项目的运行状态和数据规模";
         if (this.page === "upload") return "上传原图或已标注数据集，管理数据版本与导出";
+        if (['annotate','review'].includes(this.page)) return this.scopeDataset ? `${this.scopeDataset.name} · ${this.sourceName(this.scopeVersion?.source)} · ${this.dataState(this.scopeVersion?.status)}` : '先选择要处理的数据集，每份数据独立标注和审核';
         if (!this.flowPage) return "";
         if (!this.agent) return "还没有流程，从第 1 步开始";
         return this.agent.requirement ? `需求：${this.agent.requirement}` : this.agent.name;
@@ -2431,7 +2838,7 @@
         return this.trainingReadback && selected && !choices.includes(Number(selected)) ? [...choices, Number(selected)] : choices;
       },
       get trainingModelChoices() {
-        const prepared = this.setupMode ? this.preparedModels.filter(name => this.agent.policy.allowed_models.includes(name)) : this.preparedModels;
+        const prepared = this.preparedModels;
         return [...new Set([...prepared, ...(this.trainingReadback && this.trainForm.params.model ? [this.trainForm.params.model] : [])])];
       },
       get trainingOptimizerChoices() {
@@ -2446,14 +2853,22 @@
             version: "封存分组版本",
             schema: "新建类别版本",
             annotate: "生成候选标注",
-            sync: "回传人工审核",
+            sync: "确认并回传审核结果",
             experiment: "手动创建实验",
-            resumeAgent: this.agent?.phase === "cvat_review" ? "确认 CVAT 审核完成" : "人工处理与恢复",
+            resumeAgent: this.reviewConfirmation ? "确认并回传审核结果" : "人工处理与恢复",
             publish: "确认生产发布",
             annotationImage: "标注只读预览",
             deleteAsset: this.form.kind === "dataset" ? "删除数据集" : "删除已上传图片",
           }[this.modal] || ""
         );
+      },
+      get reviewConfirmation() {
+        return this.modal === "sync" || (this.modal === "resumeAgent" && ["cvat_review", "annotation_validation"].includes(this.agent?.phase));
+      },
+      get reviewConfirmationOutcome() {
+        return this.modal === "resumeAgent"
+          ? "提交后系统会核验并回传审核结果，成功后自动封存为训练数据。数据就绪后，仍由你到训练页确认并开始训练。"
+          : "提交后系统会核验并回传审核结果。回传成功后，请再点击“封存为训练数据”；封存完成才可在训练页选择。";
       },
       get focusRun() {
         return (
@@ -2470,18 +2885,17 @@
       get flowStep() {
         const run = this.agent;
         if (!run) return 1;
-        if (["completed", "stopped"].includes(run.status)) return 5;
+        if (run.state?.preparation_complete) return 4;
+        if (run.status === 'stopped') return run.best_model_id ? 5 : run.dataset_export_id ? 4 : PHASE_STEP[run.phase] || 2;
+        if (run.status === 'completed') return 5;
         return PHASE_STEP[run.phase] || 2;
       },
       get reusedExport() {
         // 从已审数据直接训练的流程没有自己的标注批次。
         return Boolean(this.agent?.dataset_export_id && !this.agent?.state?.annotation_run_id);
       },
-      get setupMode() {
-        return this.agent?.phase === "training_setup" && this.agent?.status === "needs_review";
-      },
       get showTrainForm() {
-        return this.setupMode || this.trainNew || !this.agent;
+        return this.trainNew || !this.agent || this.agent.state?.preparation_complete || (this.agent.phase === "training_setup" && this.agent.status === "needs_review");
       },
       get trainingReadback() {
         return !this.showTrainForm && Boolean(this.agent && this.flowStep >= 4);
@@ -2509,6 +2923,24 @@
         if (!this.llmReady) return "未配置模型服务，无法启动自主流程";
         return "";
       },
+      get isAgentSleeping() {
+        return this.agent?.status === "waiting" && this.agent.phase === "agent_sleep" && this.agent.state?.waiting?.kind === "sleep";
+      },
+      get wakeRequestPending() {
+        if (!this.isAgentSleeping) return false;
+        const until = this.agent.state.waiting.until;
+        return this.agentWakeAcceptedUntil === until || this.operatorMessages.some(item => item.sleep_until === until);
+      },
+      get canWakeAgent() {
+        return this.isAgentSleeping && !this.wakeRequestPending && !this.agent.pause_requested && !this.agent.stop_requested
+          && (this.agent.state.model_calls || 0) < (this.agent.policy.max_model_calls || 120);
+      },
+      get agentChatHint() {
+        if (this.wakeRequestPending) return "已请求唤醒，请等待 Agent 处理。当前训练继续运行。";
+        if (this.isAgentSleeping && (this.agent.state.model_calls || 0) >= (this.agent.policy.max_model_calls || 120)) return "模型调用预算已耗尽，无法继续唤醒。";
+        if (this.canWakeAgent) return "可提问或说明后续要求，例如“以后每次休眠10分钟”。Agent 保存的持续指令显示在上方，可随时撤销。模型调用计入本次预算。";
+        return "当前不在休眠状态。可查看对话记录，待 Agent 再次休眠时唤醒提问。";
+      },
       get agentStateText() {
         const run = this.agent;
         if (!run) return "";
@@ -2517,6 +2949,7 @@
         if (run.status === "paused") return "已暂停";
         if (run.status === "canceling") return "正在停止";
         if (run.status === "stopped") return "已停止";
+        if (run.state?.preparation_complete) return "数据准备已完成，训练已转到独立流程";
         if (run.status === "completed") return "已完成，可以导出模型";
         if (run.status === "needs_review")
           return (
@@ -2529,7 +2962,8 @@
         if (run.phase === "cvat_upload" && this.cvatTransfer?.progress_detail?.stage === "preparing_images")
           return "正在准备 CVAT 审核图片";
         if (run.phase === "agent_sleep" && waiting.kind === "sleep")
-          return `休眠中，预计 ${this.clock(waiting.until)} 醒来`;
+          return this.wakeRequestPending ? "已请求唤醒，等待 Agent 响应" : `休眠中，预计 ${this.clock(waiting.until)} 醒来`;
+        if (waiting.kind === "finish_tasks" && run.status === "waiting") return "正在收尾：等待评估与导出结束";
         return this.phase(run.phase);
       },
       get agentStateDetail() {
@@ -2539,8 +2973,9 @@
         if (["annotation_validation", "reviewed_export"].includes(run.phase) && this.reviewTransfer)
           return this.taskProgressText(this.reviewTransfer) || this.reviewTransfer.error || "等待后台任务执行";
         const waiting = run.state?.waiting || {};
+        if (waiting.kind === "finish_tasks" && run.status === "waiting") return "已有训练结果保留；后台任务完成校验后封存报告，可随时停止整个流程。";
         if (run.phase === "agent_sleep" && waiting.kind === "sleep")
-          return `${waiting.reason}。训练、评估或导出结束时会提前醒来。`;
+          return this.wakeRequestPending ? "唤醒请求已保存，Agent 将读取最新训练状态并处理附带问题。" : `${waiting.reason}。训练、评估或导出结束时会提前醒来，也可以手动唤醒。`;
         if (["completed", "stopped"].includes(run.status))
           return run.state?.stop_reason || "";
         return this.agentEvents.findLast((x) => x.event_type === "model_decision" && x.payload.content)?.payload.content || "";
@@ -2570,7 +3005,7 @@
         const run = this.agent;
         if (!run) return [];
         const at = PHASE_ORDER.indexOf(run.phase);
-        const finished = ["completed", "stopped"].includes(run.status);
+        const finished = run.status === "completed";
         const batch = this.annotations.find((x) => x.id === run.state?.annotation_run_id);
         const analysis = run.state?.dataset?.analysis;
         const stages = [
@@ -2578,7 +3013,7 @@
           { key: "split", name: "划分 train / val / test 并封存", phases: ["dataset_split"], detail: run.dataset_version_id ? this.entityLabel("version", run.dataset_version_id) : "" },
           {
             key: "annotate",
-            name: "Grounding DINO 生成候选框",
+            name: "按所选标注来源生成候选框",
             phases: ["auto_annotation", "annotation_quality"],
             detail: batch ? `${batch.processed} / ${batch.total} 张图` : "",
             done: batch?.processed,
@@ -2594,11 +3029,13 @@
             : finished || at > last
               ? "done"
               : at >= first
-                ? run.status === "failed"
+                ? run.status === "stopped"
+                  ? "stopped"
+                  : run.status === "failed"
                   ? "failed"
                   : "current"
                 : "todo";
-          return { ...stage, state, label: { done: "完成", current: "进行中", failed: "失败", todo: "等待", skipped: "已复用" }[state] };
+          return { ...stage, state, label: { done: "完成", current: "进行中", stopped: "已停止", failed: "失败", todo: "等待", skipped: "已复用" }[state] };
         });
       },
       get timeline() {
@@ -2617,14 +3054,16 @@
               }
             item = {
               title: tools[p.tool] || p.tool,
-              detail: p.ok ? this.toolDetail(p.tool, args) : `被拒绝：${error}`,
+              detail: p.ok ? this.toolDetail(p.tool, args, p.result) : `被拒绝：${error}`,
               reason: args.reason,
               tone: p.ok ? (p.tool === "sleep" ? "muted" : "info") : "danger",
-              stage: ({ start_experiment: "训练", stop_training: "训练", resume_training: "训练", evaluate: "评估", read_chart: "分析", read_confusion_matrix: "分析", get_experiment: "分析", read_training_log: "分析", suggest_parameters: "决策", sleep: "等待", finish: "收尾", export_model: "导出" })[p.tool] || "执行",
+              stage: ({ Skill: "知识", SkillRead: "知识", inspect_training_parameters: "分析", read_dataset_examples: "分析", read_validation_errors: "分析", compare_experiments: "分析", preview_experiment: "决策", start_experiment: "训练", stop_training: "训练", resume_training: "训练", evaluate: "评估", read_chart: "分析", read_confusion_matrix: "分析", get_experiment: "分析", read_training_log: "分析", suggest_parameters: "决策", sleep: "等待", finish: "收尾", export_model: "导出" })[p.tool] || "执行",
             };
           } else if (event.event_type === "model_decision" && p.content)
             item = { title: "Agent 说明", detail: p.content, tone: "muted" };
           else if (event.event_type === "woke") item = { title: "醒来", detail: p.reason, tone: "muted" };
+          else if (event.event_type === "wake_requested") item = { title: "你唤醒了 Agent", detail: p.question || "检查最新训练状态", tone: "info" };
+          else if (event.event_type === "operator_answer") item = { title: "Agent 回答", detail: p.answer, tone: "info" };
           else if (event.event_type === "validation_observed")
             item = {
               title: `第 ${p.iteration + 1} 轮验证完成`,
@@ -2639,8 +3078,14 @@
             item = { title: "请求人工处理", detail: p.reason, tone: "warning" };
           else if (event.event_type === "training_setup")
             item = { title: "操作者开始训练", detail: this.paramText(p.initial_parameters) || "首轮参数全部交给 Agent", tone: "info" };
+          else if (event.event_type === "data_prepared")
+            item = { title: "数据准备完成", detail: p.message, tone: "success" };
           else if (event.event_type === "failed")
             item = { title: `${this.phase(event.node)}失败`, detail: p.message, tone: "danger" };
+          else if (event.event_type === "image_request_rejected")
+            item = { title: "模型图像请求被拒绝", detail: p.action, tone: "warning" };
+          else if (event.event_type === "finish_task_unavailable")
+            item = { title: "收尾任务未执行", detail: p.message, tone: "warning" };
           else if (event.event_type === "sealed")
             item = { title: "运行报告已封存", detail: p.best_model ? this.entityLabel("model", p.best_model.model_id) : "没有有效候选", tone: "success" };
           else if (event.node === "operator" && ["pause", "resume", "stop"].includes(event.event_type))

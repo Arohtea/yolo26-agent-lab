@@ -32,13 +32,13 @@ def fingerprint(shapes: list[dict]) -> str:
     return hashlib.sha256(json.dumps(sorted(shapes, key=lambda shape:shape.get("id", 0)), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def upload_cvat(settings: Settings, run_id: str, classes: list[dict], frame_paths: list[Path], boxes: list[dict], *, progress=None) -> tuple[int, str]:
+def upload_cvat(settings: Settings, run_id: str, classes: list[dict], frame_paths: list[Path], boxes: list[dict], *, progress=None, on_created=None) -> tuple[int, str]:
     """创建本地图片任务并按实际帧名关联自动标注。
 
     :param settings: CVAT 服务配置。
     :param run_id: 平台标注批次。
     :param classes: 已冻结类别体系。
-    :param frame_paths: 方向已统一的 PNG 图片。
+    :param frame_paths: 方向已统一、保留原编码的图片。
     :param boxes: 待人工审核的真实检测框。
     :returns: CVAT 任务 ID 与上传后标注摘要。
     """
@@ -53,13 +53,18 @@ def upload_cvat(settings: Settings, run_id: str, classes: list[dict], frame_path
         if existing:
             task = existing[0]
         else:
+            task = client.tasks.create(spec={"name":task_name, "labels":[{"name":category["name"],"type":"rectangle","attributes":[{"name":name,"input_type":"text","mutable":False,"values":[],"default_value":""} for name in ("platform_id", "annotation_source", "model_version", "confidence", "flags")]} for category in classes]})
+        # 创建与传输分开；进程在大文件传输中被终止时，平台仍能定位远程任务。
+        if on_created:
+            on_created(task.id)
+        if not existing or not task.size:
             if progress:
                 progress("uploading_images")
-            task = client.tasks.create_from_data(
-                spec={"name":task_name, "labels":[{"name":category["name"],"type":"rectangle","attributes":[{"name":name,"input_type":"text","mutable":False,"values":[],"default_value":""} for name in ("platform_id", "annotation_source", "model_version", "confidence", "flags")]} for category in classes]},
+            task.upload_data(
                 resource_type=ResourceType.LOCAL, resources=[str(path) for path in frame_paths],
-                data_params={"image_quality":100,"sorting_method":"lexicographical"},
+                params={"image_quality":100,"sorting_method":"lexicographical"},
             )
+            task.fetch()
         if progress:
             progress("matching_frames")
         frame_lookup = {Path(frame.name).stem:index for index,frame in enumerate(task.get_frames_info())}
@@ -105,8 +110,15 @@ def download_cvat(settings: Settings, task_id: int, *, require_accepted: bool) -
         if task.get_meta().deleted_frames:
             raise DatasetError(409, "CVAT 存在删除的帧，不能将跳过的图片静默导出为负样本")
         jobs = task.get_jobs()
-        if require_accepted and (not jobs or any(job.stage != "acceptance" or job.state != "completed" for job in jobs)):
-            raise DatasetError(409, "CVAT 所有作业必须经人工验收并设为 acceptance/completed 后才能同步")
+        if require_accepted:
+            if not jobs:
+                raise DatasetError(409, "CVAT 审核作业尚未准备好。请等待任务创建完成并刷新审核工作区，再进入作业逐图检查。")
+            incomplete = [job for job in jobs if job.stage != "acceptance" or job.state != "completed"]
+            if incomplete:
+                stages = {"annotation": "标注", "validation": "检查", "acceptance": "验收"}
+                states = {"new": "未开始", "in progress": "进行中", "completed": "已完成", "rejected": "已驳回"}
+                examples = "；".join(f"作业 #{job.id}：{stages.get(job.stage, job.stage)} / {states.get(job.state, job.state)}" for job in incomplete[:5])
+                raise DatasetError(409, f"还有 {len(incomplete)} 个 CVAT 作业未完成验收（{examples}）。请先保存修改，将每个作业的阶段设为“验收（acceptance）”、状态设为“已完成（completed）”，再回到工作台确认并回传。")
         annotations = task.get_annotations()
         if annotations.tracks or annotations.tags:
             raise DatasetError(422, "当前仅支持静态矩形检测标注，不能忽略轨迹或分类标签")

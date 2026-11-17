@@ -65,15 +65,15 @@ def fail_dataset_task(engine: Engine, task_id: str, message: str) -> None:
     :returns: 无。
     """
     with Session(engine) as session, session.begin():
-        changed = session.execute(update(DatasetTask).where(DatasetTask.id == task_id, DatasetTask.status.in_(["queued", "running"])).values(status="failed", error=message[:4000], finished_at=utc_now()))
         task = session.get(DatasetTask, task_id)
-        if task is None or task.status != "failed":
+        if task is None or task.status not in {"queued", "running", "canceling"}:
             return
-        if changed.rowcount:
-            session.execute(update(DatasetImage).where(DatasetImage.import_task_id == task_id, DatasetImage.status == "pending").values(status="failed", error="导入任务中断，图片尚未完成检查"))
+        task.status = "stopped" if task.stop_requested else "failed"
+        task.error, task.finished_at = ("操作者终止任务" if task.stop_requested else message[:4000]), utc_now()
+        session.execute(update(DatasetImage).where(DatasetImage.import_task_id == task_id, DatasetImage.status == "pending").values(status="failed", error="导入任务中断，图片尚未完成检查"))
         # 队列记录丢失或取消时未必触发 RQ 回调，推理批次必须与失败任务一起收敛。
         if task.kind == "auto_annotate":
-            session.execute(update(AnnotationRun).where(AnnotationRun.id == task.parameters.get("run_id"), AnnotationRun.status.in_(["queued", "running"])).values(status="failed", error=task.error or message[:4000]))
+            session.execute(update(AnnotationRun).where(AnnotationRun.id == task.parameters.get("run_id"), AnnotationRun.status.in_(["queued", "running"])).values(status=task.status, error=task.error or message[:4000]))
 
 
 class DatasetService:
@@ -93,7 +93,7 @@ class DatasetService:
         dataset = session.get(Dataset, dataset_id)
         if dataset is None or dataset.deleted_at:
             raise DatasetError(404, "数据集不存在")
-        active = session.scalar(select(DatasetTask.id).where(DatasetTask.dataset_id == dataset_id, DatasetTask.status.in_(["uploading", "queued", "running"]), DatasetTask.id != excluding if excluding else True).limit(1))
+        active = session.scalar(select(DatasetTask.id).where(DatasetTask.dataset_id == dataset_id, DatasetTask.status.in_(["uploading", "queued", "running", "canceling"]), DatasetTask.id != excluding if excluding else True).limit(1))
         if active:
             raise DatasetError(409, "该数据集已有任务，请等待完成后再提交", active)
 
@@ -303,11 +303,13 @@ class DatasetService:
             task = session.get(DatasetTask, task_id)
             if task is None:
                 raise DatasetError(404, "数据集任务不存在")
-            if task.status in {"queued", "running"}:
+            if task.status in {"queued", "running", "canceling"}:
                 reason = None
+                queue_origin = None
                 try:
                     with redis_connection(self.settings) as connection:
                         job = Job.fetch(task_id, connection=connection, serializer=JSONSerializer)
+                        queue_origin = job.origin
                         state = job.get_status(refresh=True)
                         if state in {"failed", "stopped", "canceled"}:
                             reason = f"RQ 任务已终结：{state}，请查看任务日志"
@@ -320,7 +322,12 @@ class DatasetService:
                 if reason:
                     session.close()
                     fail_dataset_task(self.engine, task_id, reason)
+                    from yolo_agent.services.garbage import collect_task_garbage
+                    collect_task_garbage(self.engine, self.settings, task_id)
                     return self.get_task(task_id)
+                if task.status == "queued" and task.kind == "auto_annotate" and queue_origin:
+                    task.progress_detail = {"stage": "annotation_queued", "worker_queue": queue_origin,
+                        "independent_queue": queue_origin == self.settings.annotation_queue_name}
             session.expunge(task)
             if task.kind == "cvat_push" and task.status == "running":
                 detail = (task.result or {}).get("progress")
@@ -340,7 +347,7 @@ class DatasetService:
                               "prepared_bytes": sum(observations), "estimated": True}
                 task.progress_detail = detail
                 task.processed = detail.get("completed_images", task.processed)
-            elif task.kind in {"cvat_pull", "yolo_export"} and task.status == "running":
+            elif task.status == "running" and ((task.result or {}).get("progress") or task.kind in {"cvat_pull", "yolo_export"}):
                 detail = dict((task.result or {}).get("progress") or {
                     "stage": "reading_review" if task.kind == "cvat_pull" else "export_working",
                     "total_images": task.total, "estimated": True,

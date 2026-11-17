@@ -173,7 +173,7 @@ def annotation_tasks(run_id: str, limit: int = Query(20, ge=1, le=200), offset: 
     with Session(service.engine) as session:
         tasks = list(session.scalars(select(DatasetTask).where(DatasetTask.parameters["run_id"].as_string() == run_id).order_by(DatasetTask.created_at.desc(), DatasetTask.id).limit(limit).offset(offset)))
     datasets = DatasetService(service.engine, service.settings)
-    return [datasets.get_task(task.id) if task.status in {"queued", "running"} else task for task in tasks]
+    return [datasets.get_task(task.id) if task.status in {"queued", "running", "canceling"} else task for task in tasks]
 
 
 @router.get("/annotation-runs/{run_id}/quality")
@@ -284,6 +284,33 @@ def export_yolo(run_id: str, service: AnnotationService = Depends(annotation_ser
     return service.schedule(run_id, "yolo_export")
 
 
+@router.post("/annotation-runs/{run_id}/cancel")
+def cancel_annotation_run(run_id: str, service: AnnotationService=Depends(annotation_service)):
+    """停止候选标注或人工审核批次；现有标注保留，禁止后续自动继续。"""
+    from yolo_agent.models.agent import AgentRun
+    from yolo_agent.services.task_control import cancel_task
+    with Session(service.engine) as session:
+        run = session.get(AnnotationRun, run_id)
+        if run is None:
+            raise DatasetError(404, "标注批次不存在")
+        if run.status == "exported":
+            raise DatasetError(409, "该批次已完成，请在训练页停止正在进行的训练")
+        tasks = list(session.scalars(select(DatasetTask.id).where(DatasetTask.parameters["run_id"].as_string() == run_id,
+            DatasetTask.status.in_(["queued", "running", "canceling"]))))
+    for identity in tasks:
+        cancel_task(service.engine, service.settings, "dataset", identity)
+    with Session(service.engine) as session, session.begin():
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        run = session.get(AnnotationRun, run_id)
+        if run.status == "exported":
+            return {"id": run_id, "status": "exported"}
+        run.status, run.error = "stopped", "操作者停止此批次，已有标注已保留"
+        for agent in session.scalars(select(AgentRun).where(AgentRun.state["annotation_run_id"].as_string() == run_id,
+            AgentRun.status.not_in(["completed", "stopped", "failed"]))):
+            agent.stop_requested, agent.status = True, "canceling"
+    return {"id": run_id, "status": "stopped"}
+
+
 @router.get("/dataset-exports", response_model=list[ExportRead])
 def list_exports(run_id: str | None = None, project_id: str|None=None, limit: int=Query(50,ge=1,le=200), offset: int=Query(0,ge=0), service: AnnotationService = Depends(annotation_service)) -> list[DatasetExport]:
     """查询可供训练绑定的已审核工件。
@@ -318,6 +345,8 @@ def download_export(export_id: str, service: AnnotationService = Depends(annotat
         export = session.get(DatasetExport, export_id)
         if export is None:
             raise DatasetError(404, "工件不存在")
+        if not export.archive_path:
+            raise DatasetError(409, "训练数据已就绪；如需下载 ZIP，请在数据集版本中点击「导出数据集」")
         path = owned_path(service.settings, export.archive_path)
         if not path.is_file():
             raise DatasetError(409, "数据工件缺失")

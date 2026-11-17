@@ -13,6 +13,7 @@ from yolo_agent.models.dataset import Dataset, DatasetImage, DatasetTask, Datase
 from yolo_agent.schemas.dataset import LabeledImportOptions
 from yolo_agent.services.datasets import DatasetError, DatasetService, owned_path
 from yolo_agent.services.inspector import FORMATS
+from yolo_agent.services.annotations import assert_reviewed
 
 
 def submit_dataset_copy(service: DatasetService, source_id: str, data):
@@ -26,7 +27,9 @@ def submit_dataset_copy(service: DatasetService, source_id: str, data):
                 raise DatasetError(404, "目标项目不存在")
             if source.project_id == data.project_id:
                 raise DatasetError(422, "请选择其他项目的数据集")
-            version = session.get(DatasetVersion, data.version_id) if data.version_id else None
+            if not data.version_id:
+                raise DatasetError(422, "只能引用完成标注和审核的版本，请先选择已审版本")
+            version = session.get(DatasetVersion, data.version_id)
             if data.version_id and (version is None or version.dataset_id != source_id or not version.sealed):
                 raise DatasetError(422, "来源版本必须是所选数据集的已封存版本")
             if version:
@@ -38,8 +41,12 @@ def submit_dataset_copy(service: DatasetService, source_id: str, data):
                 raise DatasetError(409, "来源数据集没有可复制的图片")
             if len(ids) > service.settings.max_dataset_images:
                 raise DatasetError(413, "来源图片数量超过数据集上限")
-            run_id = session.scalar(select(AnnotationRun.id).where(AnnotationRun.version_id == version.id,
-                AnnotationRun.status.in_(["pending_review", "reviewed", "exported"])).order_by(AnnotationRun.created_at.desc(), AnnotationRun.id.desc()).limit(1)) if version else None
+            run = session.scalar(select(AnnotationRun).where(AnnotationRun.version_id == version.id)
+                .order_by(AnnotationRun.created_at.desc(), AnnotationRun.id.desc()).limit(1))
+            if not run or run.status not in {"reviewed", "exported"}:
+                raise DatasetError(409, "来源版本尚未完成标注和审核，不能引用")
+            run_id = run.id
+            assert_reviewed(session, run)
             session.add(Dataset(id=target_id, project_id=data.project_id, name=data.name,
                 description=f"复制自项目数据集「{source.name}」，后续独立管理。"))
             session.flush()

@@ -80,6 +80,7 @@ def finalize_run(service: AgentService, run_id: str, reason: str, *, status: str
     result={"agent_run_id":run_id,"name":run.name,"status":status,"finished_at":utc_now(),"stop_reason":reason,"dataset_version_id":run.dataset_version_id,"dataset_export_id":run.dataset_export_id,"policy":run.policy,"budget":service.budget(run_id),"test_used":False,"iterations":items,"best_model":best,"production_published":False,"selection_unavailable_reason":None if best else "没有通过默认验证协议且工件有效的完成模型","selection":"agent" if chosen else "highest_val_map","agent_summary":finish.get("summary") or None,"agent_choice_rejected":bool(finish.get("best_experiment_id")) and not chosen,"limitations":["仅按固定 val 的真实 mAP50-95 选择候选，不保证下一轮提升","样本与类别支持量限制必须与指标一起阅读","Mac CPU 结果不计作 NVIDIA GPU 验收","生产模型发布仍需人工确认"]}
     result["last_error"]=run.error
     result["agent_summary_status"]="unverified_model_text"
+    result["agent_value_assessment"]=finish.get("value_assessment")
     result["stagnation"]=run.state.get("stagnation")
     result["stop_notice"]=run.state.get("stop_notice")
     result["recommendations"]=(result["stop_notice"] or {}).get("recommendations",[])
@@ -106,8 +107,16 @@ def finalize_run(service: AgentService, run_id: str, reason: str, *, status: str
         devices=",".join(dict.fromkeys(task["device"] or "未知" for task in item["training_attempts"]))
         lines.append(f"| {item['iteration']+1} | `{item['experiment_id']}` | {value if value is not None else '无法评估'} | {devices} | {conclusion} |")
     lines.extend(["",f"最佳候选：`{best['model_id']}`，mAP50-95={best['map50_95']}（{'Agent 指定' if chosen else '按验证集 mAP 选择'}）。" if best else "没有可选择的有效候选。",*(["Agent 指定的实验没有有效验证结果，已改按验证集 mAP 选择。"] if result["agent_choice_rejected"] else []),*(["","## Agent 总结原文","","以下为未逐句验证的模型原文；方向、数字与归因以每轮结构化证据为准。",finish["summary"]] if finish.get("summary") else []),"","生产发布未执行，保留人工确认。","",f"完整机器报告：`storage/{output.relative_to(service.settings.storage_dir.resolve())}`；SHA256：`{digest}`。","","## 每轮决策与证据"])
+    if result["agent_value_assessment"]:
+        assessment=result["agent_value_assessment"]
+        lines.extend(["", "### 结束本次训练的价值判断（模型原文）", "", "以下为 Agent 的判断，预期价值不代表实测收益。",
+            f"已有证据：{assessment['evidence']}", f"继续训练的预期价值：{assessment['expected_benefit']}", f"成本权衡：{assessment['cost_tradeoff']}"])
     for item in items:
         lines.extend(["",f"### 第 {item['iteration']+1} 轮","",item["plan"]["reason"],"",f"变量变化：`{json.dumps(item['changed_variables'],ensure_ascii=False)}`",f"父实验：`{item['parent_experiment_id']}`；评估：`{item['evaluation_id']}`；Optuna：`{item['optuna_trial_number']}`。",f"数据建议：{'; '.join(item['plan'].get('data_actions',[])) or '无新增建议'}"])
+        if item["plan"].get("value_assessment"):
+            assessment=item["plan"]["value_assessment"]
+            lines.extend(["", "继续训练的价值判断（模型原文，预期收益未验证）：", f"已有证据：{assessment['evidence']}",
+                f"预期价值：{assessment['expected_benefit']}", f"成本权衡：{assessment['cost_tradeoff']}"])
         if len(item["changed_variables"])>1:
             lines.extend(["",f"可比性说明：本轮实际同时改变 {len(item['changed_variables'])} 个变量，不能将指标差异归因于单一变量；上述模型理由保留为规划假设原文。"])
         comparison=item["comparison"]

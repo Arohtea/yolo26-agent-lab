@@ -28,8 +28,8 @@ def fail_export(engine: Engine, export_id: str, reason: str) -> None:
     """
     with Session(engine) as session, session.begin():
         record = session.get(ModelExport, export_id)
-        if record and record.status in {"queued", "running"}:
-            record.status, record.error, record.finished_at = "failed", reason[:4000], utc_now()
+        if record and record.status in {"queued", "running", "canceling"}:
+            record.status, record.error, record.finished_at = ("stopped" if record.stop_requested else "failed"), ("操作者终止导出" if record.stop_requested else reason[:4000]), utc_now()
 
 
 class ExportService:
@@ -86,7 +86,7 @@ class ExportService:
             if record is None:
                 raise DatasetError(404, "导出任务不存在")
             reason = None
-            if record.status in {"queued", "running"}:
+            if record.status in {"queued", "running", "canceling"}:
                 try:
                     with redis_connection(self.settings) as connection:
                         job = Job.fetch(export_id, connection=connection, serializer=JSONSerializer)
@@ -100,6 +100,8 @@ class ExportService:
             if reason:
                 session.close()
                 fail_export(self.engine, export_id, reason)
+                from yolo_agent.services.garbage import collect_export_garbage
+                collect_export_garbage(self.engine, self.settings, export_id)
                 return self.get(export_id)
             session.expunge(record)
             return record

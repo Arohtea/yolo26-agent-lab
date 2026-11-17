@@ -65,6 +65,22 @@ def stagnation_recommendations(issues: list[dict]) -> list[str]:
     return advice
 
 
+def search_distributions(settings: Settings, policy: AgentPolicy) -> dict:
+    """复用 Optuna 分布描述搜索边界，查询和预检不创建研究或试验。"""
+    content = yaml.safe_load(settings.optimization_config_path.read_text())["search_space"]
+    images = [int(value) for value in content["imgsz"] if 64 <= int(value) <= policy.max_imgsz and int(value) % 32 == 0] or [policy.max_imgsz]
+    result = {"imgsz": CategoricalDistribution(images), "optimizer": CategoricalDistribution(content["optimizer"]), "mosaic": CategoricalDistribution(content["mosaic"])}
+    for key in ("lr0", "weight_decay"):
+        entry = content[key]
+        result[key] = FloatDistribution(float(entry["low"]), float(entry["high"]), log=bool(entry.get("log", False)))
+    return result
+
+
+def describe_search_space(distributions: dict) -> dict:
+    return {name: {"choices": list(value.choices)} if isinstance(value, CategoricalDistribution)
+        else {"low": value.low, "high": value.high, "log": value.log} for name, value in distributions.items()}
+
+
 class OptimizationStudy:
     """每个 Agent 运行独立 study，复用成熟 TPE 和 ask/tell。"""
 
@@ -79,14 +95,7 @@ class OptimizationStudy:
         self.settings, self.run_id, self.policy = settings, run_id, policy
         root = settings.storage_dir.resolve() / "agents"
         root.mkdir(parents=True, exist_ok=True)
-        content = yaml.safe_load(settings.optimization_config_path.read_text())["search_space"]
-        images = [int(value) for value in content["imgsz"] if 64<=int(value)<=policy.max_imgsz and int(value)%32==0]
-        if not images:
-            images = [policy.max_imgsz]
-        self.distributions = {"imgsz":CategoricalDistribution(images),"optimizer":CategoricalDistribution(content["optimizer"]),"mosaic":CategoricalDistribution(content["mosaic"])}
-        for key in ("lr0","weight_decay"):
-            entry = content[key]
-            self.distributions[key] = FloatDistribution(float(entry["low"]),float(entry["high"]),log=bool(entry.get("log",False)))
+        self.distributions = search_distributions(settings, policy)
         storage = optuna.storages.RDBStorage(url=f"sqlite:///{root/'optuna.db'}",engine_kwargs={"connect_args":{"timeout":5}})
         self.study = optuna.create_study(storage=storage,study_name=f"agent-{run_id}",load_if_exists=True,direction="maximize",sampler=optuna.samplers.TPESampler(seed=42,n_startup_trials=1))
 
@@ -152,13 +161,7 @@ class OptimizationStudy:
 
         :returns: 无可执行内容的搜索空间。
         """
-        result = {}
-        for name,distribution in self.distributions.items():
-            if isinstance(distribution,CategoricalDistribution):
-                result[name] = {"choices":list(distribution.choices)}
-            else:
-                result[name] = {"low":distribution.low,"high":distribution.high,"log":distribution.log}
-        return result
+        return describe_search_space(self.distributions)
 
     def _validate_search(self, values: dict) -> None:
         for name,value in values.items():

@@ -16,7 +16,7 @@ from pydantic import Field, create_model
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from yolo_agent.agents.optimization import OptimizationStudy, stagnation_progress
+from yolo_agent.agents.optimization import OptimizationStudy, describe_search_space, search_distributions, stagnation_progress
 from yolo_agent.agents.evidence import confusion_evidence
 from yolo_agent.agents.experiment_design import comparison_design, validate_experiment_design
 from yolo_agent.models.agent import AgentEvent, AgentIteration
@@ -24,12 +24,14 @@ from yolo_agent.models.annotation import AnnotationRun, DatasetExport
 from yolo_agent.models.dataset import Dataset, DatasetVersion
 from yolo_agent.models.evaluation import EvaluationInvalidation, EvaluationTask
 from yolo_agent.models.experiment import Experiment, ExperimentMetric, ModelArtifact, ModelExport, TrainingTask
-from yolo_agent.schemas.agent import AgentPolicy
+from yolo_agent.schemas.agent import AgentPolicy, OperatorInstructionChange
+from yolo_agent.schemas.agent_tools import CompareExperimentsArgs, ConfusionReadArgs, DatasetExamplesArgs, ExperimentInspectArgs, ParameterInfoArgs, ValidationErrorsArgs
 from yolo_agent.schemas.annotation import AutoAnnotateCreate, CvatReviewConfirm
 from yolo_agent.schemas.dataset import AnalysisCreate, InputModel, VersionCreate
 from yolo_agent.schemas.evaluation import EvaluationCreate
 from yolo_agent.schemas.experiment import ExecutionLimits, ExperimentCreate, ModelExportCreate, TrainingParameters
 from yolo_agent.services.agents import AgentService
+from yolo_agent.services.agent_skills import SKILL_TOOLS, training_skills
 from yolo_agent.services.annotations import AnnotationService
 from yolo_agent.services.datasets import DatasetError, DatasetService, owned_path
 from yolo_agent.services.evaluation import EvaluationService
@@ -37,6 +39,7 @@ from yolo_agent.services.exports import ExportService
 from yolo_agent.services.training import TrainingService, validate_export
 from yolo_agent.services.chart_artifacts import CHARTS
 from yolo_agent.workers.queue import RUNTIME_PREFIX, redis_connection
+from yolo_agent.tools.training_inspection import TrainingInspection
 
 ACTIVE = {"queued", "running", "canceling"}
 # 图名固定映射到训练库产物；训练目录只含 train/val，评估目录只含 val，测试集图像无从读取。
@@ -74,8 +77,16 @@ class LogArgs(InputModel):
     lines: int = Field(default=80, ge=10, le=300)
 
 
+class TrainingValueAssessment(InputModel):
+    """由 Agent 判断训练价值，不用固定分数代替证据与成本权衡。"""
+
+    evidence: str = Field(min_length=10, max_length=1200, description="引用已有实验、曲线或错误样例；区分事实与未知，不编造验证结果")
+    expected_benefit: str = Field(min_length=10, max_length=1000, description="继续训练能验证什么尚未解决的假设；结束时说明为何当前没有值得追加训练的方向，不承诺数值收益")
+    cost_tradeoff: str = Field(min_length=10, max_length=1000, description="结合已用耗时、剩余预算与数据/模型限制，说明预期价值是否值得新增成本；无法估时则说明未知")
+
+
 class StartArgs(InputModel):
-    """参数只写变化项，其余继承父实验；首轮继承操作者起点。"""
+    """参数只写变化项；首轮基于平台默认值和操作者明确填写值，后续继承父实验。"""
 
     parameters: dict = Field(default_factory=dict)
     dataset_export_id: str | None = None
@@ -83,6 +94,7 @@ class StartArgs(InputModel):
     comparison_mode: Literal["joint_search", "ablation"] = Field(default="joint_search", description="默认联合搜索可改多项，只评价配置整体；定向消融用于有预算时验证一个变量")
     target_parameter: str | None = Field(default=None, max_length=100)
     hypothesis: str | None = Field(default=None, min_length=10, max_length=1000)
+    value_assessment: TrainingValueAssessment | None = Field(default=None, description="首轮可省略；后续开训必须提供继续训练的必要性判断，不能仅因还有预算就继续")
     reason: str = Field(min_length=10, max_length=2000)
 
 
@@ -97,6 +109,7 @@ class ResumeArgs(InputModel):
 
     experiment_id: str
     reason: str = Field(min_length=4, max_length=2000)
+    value_assessment: TrainingValueAssessment | None = Field(default=None, description="真正恢复训练前必须说明剩余训练的预期价值与成本，已在运行时可省略")
 
 
 class ExportArgs(InputModel):
@@ -128,26 +141,40 @@ class FinishArgs(InputModel):
     best_experiment_id: str | None = None
     reason: str = Field(min_length=10, max_length=2000)
     summary: str = Field(default="", max_length=4000)
+    value_assessment: TrainingValueAssessment | None = Field(default=None, description="主动提前结束时给出收益递减、目标达成或现有限制的证据；停止不要求用完停滞轮数或预算")
 
 
 class NoArgs(InputModel):
     """无参数工具。"""
 
 
+class OperatorAnswerArgs(OperatorInstructionChange):
+    """回答训练档案中真实存在的操作者问题。"""
+
+    request_id: int = Field(ge=1)
+    answer: str = Field(min_length=1, max_length=4000)
+
+
 TOOLS = {
+    "inspect_training_parameters": (ParameterInfoArgs, "按 names 查询本平台当前真正支持的参数、现值来源、模型锁定和本运行 Schema；技能提及不代表参数已开放。最多八项，未开放项明确返回 supported=false。"),
+    "read_dataset_examples": (DatasetExamplesArgs, "首轮前也可查看已审封存 train/val 样例与真值框；按类别或 image_ids 筛选，分页最多两图。不能读取 test，原图和标注均核对封存指纹。标注可用 box_offset 继续读取。"),
+    "read_validation_errors": (ValidationErrorsArgs, "按真实类名、漏检 fn/误检 fp、小目标漏检筛选固定 val 错误，按错误数排序并分页，最多两图。需要已有完成评估。只读已保存匹配结果，不重新推理；可按 image_id 与 box_offset 继续读取标注。"),
+    "compare_experiments": (CompareExperimentsArgs, "直接比较本运行两个指定实验的参数与逐类指标，不限父子关系。同一数据和兼容评估协议才返回指标增量；否则明确不可比。类别与分页可定向查询，不证明单项因果。"),
+    "preview_experiment": (StartArgs, "开训前只读预检候选参数、首轮约束、实验设计、数据、预算和训练槽；不创建实验、Optuna 试验或训练。与 start_experiment 共用校验；valid=true 但 can_start=false 表示配置有效、当前仍须等待。"),
+    "answer_operator": (OperatorAnswerArgs, "回答真实操作者问题。明确的后续持续要求用 instruction_action=remember、稳定 instruction_key 保存原文；休眠周期固定用 key=sleep_interval 并填写 sleep_minutes。新要求用相同 key 替换旧要求；明确取消用 forget。普通提问用 none。不能借此修改冻结预算、模型白名单或批准标注。"),
     "read_chart": (ChartArgs, "读取本运行实验的图：training 来源有 results 曲线、labels 标签分布、train_batch、val 混淆矩阵与 PR/F1/P/R 曲线、val 预测样例；evaluation 来源是固定 val 协议评估的同类图。一次最多 4 张，图像只在下一轮可见，请在之后的 reason 中写下观察。"),
-    "get_experiment": (ExperimentArgs, "读取实验完整参数、实际解析参数、全部逐 epoch 指标、训练尝试、val 评估逐类结果、混淆矩阵与错误样本。"),
-    "read_confusion_matrix": (ExperimentArgs, "读取固定 val 混淆矩阵的结构化证据：程序计算真值→预测方向、计数、真值分母与漏检比例。类别混淆的数字以此为准，禁止从图片猜轴或读数。"),
+    "get_experiment": (ExperimentInspectArgs, "定向读取本运行实验：overview 概览；parameters 按 parameter_names 查请求值与实际值；curve 按 metric_names 和 offset/limit 查未抽样的逐 epoch 表；evaluation 按 class_names 分页读逐类指标；training 查训练尝试。避免一次索取全部结果导致截断。"),
+    "read_confusion_matrix": (ConfusionReadArgs, "分页读取固定 val 混淆矩阵结构化证据：真值→预测方向、计数、真值分母与漏检比例。可用 class_names 指定类别，默认五类。禁止从图片猜轴或读数。"),
     "read_training_log": (LogArgs, "读取实验最近一次训练尝试的日志末尾，用于排查失败或异常。"),
-    "suggest_parameters": (NoArgs, "向 Optuna TPE 请求下一轮受限参数建议，仅供参考，可以不采用。"),
-    "start_experiment": (StartArgs, "新建实验并立即开始训练。首轮建立基线；后续填写 hypothesis。默认 joint_search 可同时改多项，只评价整组配置收益；预算允许且需要验证单项贡献时用 ablation，必须保持同一数据且只改 target_parameter 一项。"),
+    "suggest_parameters": (NoArgs, "向 Optuna TPE 请求下一轮受限参数建议，仅供参考，可以不采用；采样器仍能给建议不代表继续训练有价值。"),
+    "start_experiment": (StartArgs, "新建实验并立即开始训练。首轮建立基线；后续必须填写 hypothesis 和 value_assessment，说明证据、预期价值及成本权衡，没有值得验证的方向时应 finish，无需等到停滞阈值。默认 joint_search 比较整组配置；必要且有预算时才做单变量 ablation。"),
     "stop_training": (ReasonArgs, "暂停本运行正在进行的训练：在批次边界保存检查点后进入 stopped，之后可用 resume_training 继续，或放弃并开新实验。"),
-    "resume_training": (ResumeArgs, "从检查点继续已暂停或失败的实验，参数不变。"),
+    "resume_training": (ResumeArgs, "从检查点继续已暂停或失败的实验，参数不变。真正恢复前必须提供 value_assessment；检查点可恢复不代表值得继续，过拟合或数据瓶颈未解决时不应无意义恢复。"),
     "evaluate": (ExperimentArgs, "对已完成实验的 best 权重提交固定 val 协议评估。训练完成后系统会自动提交，一般只在评估失败后使用。"),
     "export_model": (ExportArgs, "把实验的 best/last 权重导出为 ONNX 或 TorchScript，并用对应运行时加载校验。导出不等于生产发布。"),
     "sleep": (SleepArgs, "休眠指定分钟数。期间训练、评估或导出任务结束会提前唤醒你。"),
     "request_human_review": (ReviewArgs, "遇到训练无法解决的数据问题（标注错误、类别缺样本、验证集不具代表性）时请求人工处理，流程暂停到操作者确认。"),
-    "finish": (FinishArgs, "结束本次运行并指定最佳实验，系统据此封存报告；生产发布仍由人工完成。"),
+    "finish": (FinishArgs, "可在停滞阈值或预算耗尽之前主动结束本次运行，保留最佳实验并封存报告。目标已有证据达成、收益不抵成本、无有据可行的新假设或现有数据/锁定模型限制收益时应考虑结束，value_assessment 解释依据和未解决的问题。不要仅因预算尚余而继续，也不能无证据宣称达标；生产发布仍由人工完成。"),
 }
 CONTROL_TOOLS = {"sleep", "request_human_review", "finish"}
 
@@ -229,6 +256,9 @@ class WorkflowTools:
         """
         return OptimizationStudy(self.settings, self.run_id, self.policy())
 
+    def search_space(self) -> dict:
+        return describe_search_space(search_distributions(self.settings, self.policy()))
+
     # ---- 前半段固定节点使用的工具 ----
 
     def analyze(self):
@@ -253,7 +283,7 @@ class WorkflowTools:
                 raw = connection.get(key)
                 if raw:
                     report = json.loads(raw)
-                    reports.append({name: report.get(name) for name in ("collected_at", "os", "architecture", "effective_device", "gpu_count", "gpus", "torch_version", "cuda_runtime_version", "selection_reason", "warnings")})
+                    reports.append({name: report.get(name) for name in ("collected_at", "worker_role", "queue_name", "os", "architecture", "effective_device", "gpu_count", "gpus", "torch_version", "cuda_runtime_version", "selection_reason", "warnings")})
         return {"workers": reports, "unavailable_reason": None if reports else "没有近期计算 Worker 报告，不能假定计算设备可用", "note": "真正接单的 Worker 会重新检测设备，排队最长等待受单独上限约束"}
 
     def split(self):
@@ -322,11 +352,15 @@ class WorkflowTools:
             invalid = session.get(EvaluationInvalidation, evaluation_id)
         if not owned or invalid or task.status != "completed" or task.parameters != EvaluationCreate().model_dump():
             raise DatasetError(409, "只能使用本运行、默认协议且未失效的完成评估")
+        if not task.report_path:
+            raise DatasetError(409, "验证报告尚未生成")
         path = owned_path(self.settings, task.report_path)
-        if hashlib.sha256(path.read_bytes()).hexdigest() != task.report_sha256:
+        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != task.report_sha256:
             raise DatasetError(409, "验证报告指纹变化")
         report = json.loads(path.read_text())
-        if report["split"] != "val" or report["test_used"] or report["dataset_export_id"] != task.dataset_export_id:
+        identity = {"evaluation_id": task.id, "experiment_id": task.experiment_id, "model_id": task.model_id,
+            "dataset_export_id": task.dataset_export_id, "parameters": task.parameters, "split": "val", "test_used": False}
+        if any(report.get(key) != value for key, value in identity.items()):
             raise PermissionError("评估协议或数据版本漂移")
         return report
 
@@ -374,9 +408,9 @@ class WorkflowTools:
         """
         refs = [{"kind": "training", "id": task.id} for task in self._active_training()]
         for _, experiment in self.iterations():
-            refs += [{"kind": "evaluation", "id": task.id} for task in self._evaluations(experiment.id) if task.status in {"queued", "running"}]
+            refs += [{"kind": "evaluation", "id": task.id} for task in self._evaluations(experiment.id) if task.status in ACTIVE]
             model_ids = [model.id for model in self._models(experiment.id)]
-            refs += [{"kind": "export", "id": record.id} for record in self.exports.list(model_ids=model_ids) if record.status in {"queued", "running"}]
+            refs += [{"kind": "export", "id": record.id} for record in self.exports.list(model_ids=model_ids) if record.status in ACTIVE and record.requested_by == f"agent:{self.run_id}"]
         return refs
 
     def allowed_exports(self) -> list[dict]:
@@ -390,7 +424,7 @@ class WorkflowTools:
         with Session(self.engine) as session:
             base = session.get(DatasetExport, run.dataset_export_id)
             classes = validate_export(self.settings, base, verify_files=False)["classes"]
-            rows = list(session.scalars(select(DatasetExport).join(DatasetVersion, DatasetVersion.id == DatasetExport.version_id).join(Dataset, Dataset.id == DatasetVersion.dataset_id).join(AnnotationRun, AnnotationRun.id == DatasetExport.run_id).where(Dataset.project_id == run.project_id, DatasetVersion.sealed.is_(True), AnnotationRun.status == "exported").order_by(DatasetExport.created_at)))
+            rows = list(session.scalars(select(DatasetExport).join(DatasetVersion, DatasetVersion.id == DatasetExport.version_id).join(Dataset, Dataset.id == DatasetVersion.dataset_id).join(AnnotationRun, AnnotationRun.id == DatasetExport.run_id).where(Dataset.project_id == run.project_id, Dataset.deleted_at.is_(None), DatasetVersion.sealed.is_(True), AnnotationRun.status == "exported").order_by(DatasetExport.created_at)))
         result = []
         for export in rows:
             try:
@@ -528,13 +562,25 @@ class WorkflowTools:
             return {"status": "unavailable", "reason": str(error), "rule": "禁止从图片替代推算方向和数字"}
         return {"status": "completed", "report_sha256": task.report_sha256, **evidence}
 
-    def read_confusion_matrix(self, experiment_id: str) -> dict:
+    def read_confusion_matrix(self, experiment_id: str, *, class_names: list | None = None, offset: int = 0, limit: int = 5) -> dict:
         self.guard()
         self._own(experiment_id)
         completed = [task for task in self._evaluations(experiment_id) if task.status == "completed"]
         if not completed:
             return {"status": "unavailable", "reason": "尚无有效固定 val 评估，请等待；禁止根据训练图猜测矩阵数值"}
-        return self._confusion_evidence(completed[-1])
+        evidence = self._confusion_evidence(completed[-1])
+        if evidence.get("status") != "completed":
+            return evidence
+        rows = evidence["per_true_class"]
+        if set(class_names or []) - {row["true_class"] for row in rows}:
+            raise ValueError("请使用混淆矩阵中的实际类别名")
+        rows = [row for row in rows if not class_names or row["true_class"] in class_names]
+        selected = rows[offset:offset + limit]
+        names = {row["true_class"] for row in selected}
+        return {**evidence, "per_true_class": selected, "total_true_classes": len(rows), "offset": offset,
+            "has_more": offset + limit < len(rows),
+            "top_confusions": [row for row in evidence["top_confusions"] if row["true_class"] in names],
+            "unmatched_predictions_by_predicted_class": [row for row in evidence["unmatched_predictions_by_predicted_class"] if row["predicted_class"] in names]}
 
     def experiment_brief(self, item: AgentIteration, experiment: Experiment, *, full: bool) -> dict:
         """单个实验的档案条目，full=False 时只保留比较所需字段。
@@ -554,6 +600,7 @@ class WorkflowTools:
         brief.update(
             parent_experiment_id=experiment.parent_experiment_id, parameters=experiment.parameters, reason=item.plan.get("reason"),
             comparison_mode=item.plan.get("comparison_mode"), target_parameter=item.plan.get("target_parameter"), hypothesis=item.plan.get("hypothesis"),
+            value_assessment=item.plan.get("value_assessment"),
             resolved={"device": resolved.get("device"), "batch": resolved.get("batch"), "optimizer": effective.get("class"), "lr": [group.get("lr") for group in effective.get("groups", [])][:1], "trainer_parameters": resolved.get("trainer_parameters"), "augmentation_effective_at_start": resolved.get("augmentation_effective_at_start")},
             attempts=[{"task_id": task.id, "status": task.status, "epoch": f"{task.current_epoch}/{task.total_epochs}", "elapsed_seconds": round(task.elapsed_seconds), "seconds_per_epoch": round(task.elapsed_seconds / task.current_epoch, 1) if task.current_epoch else None, "resumable": bool(task.checkpoint_path) and task.status in {"failed", "stopped"}, "error": (task.error or "")[:300] or None} for task in tasks],
             curve=self.epoch_table(experiment.id), final_train_metrics={key: _round(value) for key, value in (experiment.final_metrics or {}).items()},
@@ -632,6 +679,17 @@ class WorkflowTools:
 
     # ---- 暴露给模型的工具 ----
 
+    def skill_knowledge(self) -> dict:
+        """档案只列技能索引与已读来源，不把全部技能正文塞入每轮上下文。"""
+        skills = training_skills(self.settings)
+        if skills is None:
+            return {"enabled": False, "available": [], "consulted": {}}
+        run = self.service.get(self.run_id)
+        return {"enabled": True, "available": skills.catalog(),
+            "source": {"repository": skills.manifest["repository"], "revision": skills.manifest["revision"]},
+            "consulted": run.state.get("skill_reads", {}),
+            "rule": "使用 Skill 按需加载技能，使用 SkillRead 读取其中列出的参考文件；已读来源不代表正文永久保留，对话裁剪后可重新读取。技能是知识参考，参数、数据与预算仍以本次平台档案和工具校验为准。"}
+
     def _parameter_model(self):
         """按冻结策略、已准备模型和 Optuna 搜索空间动态收紧参数类型。"""
         policy, prepared = self.policy(), self.prepared_models()
@@ -649,7 +707,7 @@ class WorkflowTools:
             "epochs": (int | None, Field(default=None, ge=1, le=policy.max_epochs_per_experiment)),
             "imgsz": (int | None, Field(default=None, ge=64, le=policy.max_imgsz, multiple_of=32)),
         })
-        for name, space in self.study().search_space().items():
+        for name, space in self.search_space().items():
             fields[name] = (Literal[tuple(space["choices"])] | None, None) if "choices" in space else (float | None, Field(default=None, ge=space["low"], le=space["high"]))
         return create_model("ParameterChanges", __base__=InputModel, **fields)
 
@@ -661,10 +719,13 @@ class WorkflowTools:
         result = []
         for name, (model, description) in TOOLS.items():
             schema = model.model_json_schema()
-            if name == "start_experiment":
-                schema["properties"]["parameters"] = {**self._parameter_model().model_json_schema(), "description": "只写要改变的训练参数，未写的继承父实验"}
+            if name in {"start_experiment", "preview_experiment"}:
+                schema["properties"]["parameters"] = {**self._parameter_model().model_json_schema(), "description": "只写要调整的训练参数。首轮未写项使用平台默认值及操作者明确填写值，只有 operator_first_round.pinned 是操作者首轮约束，其余可调项首轮即可覆盖；后续未写项继承父实验。所有轮次均遵守模型白名单与预算。"}
             schema.pop("title", None)
             result.append({"type": "function", "function": {"name": name, "description": description, "parameters": schema}})
+        skills = training_skills(self.settings)
+        if skills is not None:
+            result.extend(skills.specs())
         return result
 
     def control_args(self, name: str, arguments: dict) -> dict:
@@ -675,7 +736,12 @@ class WorkflowTools:
         :returns: 校验后的参数。
         """
         model = TOOLS[name][0]
-        return model.model_validate(arguments).model_dump()
+        result = model.model_validate(arguments).model_dump()
+        if name == "sleep":
+            interval = next((item for item in self.service.operator_instructions(self.run_id) if item["key"] == "sleep_interval"), None)
+            if interval and result["minutes"] != interval["sleep_minutes"]:
+                raise ValueError(f"操作者当前要求每次休眠 {interval['sleep_minutes']:g} 分钟，请使用 minutes={interval['sleep_minutes']:g}。任务完成仍会提前唤醒；变更节奏须按操作者新指令替换或撤销。")
+        return result
 
     def dispatch(self, name: str, arguments: dict, *, key: str) -> dict:
         """执行一次非控制类工具调用。
@@ -685,19 +751,35 @@ class WorkflowTools:
         :param key: 由轮次与调用位置推导的确定性键，重放时复用同一业务身份。
         :returns: 可 JSON 序列化的结果；以下划线开头的键只在系统内部使用。
         """
+        if name in SKILL_TOOLS:
+            self.guard("optimize")
+            skills = training_skills(self.settings)
+            if skills is None:
+                raise ValueError("本次平台配置已关闭技能读取")
+            output = skills.read(name, arguments)
+            run = self.service.get(self.run_id)
+            identity = f"{output['skill_name']}/{output['file_name']}"
+            source = {key: output[key] for key in ("source", "sha256")}
+            self.service.patch(self.run_id, state={"skill_reads": {**run.state.get("skill_reads", {}), identity: source}})
+            return output
         if name not in TOOLS or name in CONTROL_TOOLS:
             raise ValueError(f"未知工具：{name}")
         args = TOOLS[name][0].model_validate(arguments)
+        if name == "preview_experiment":
+            return self.preview_experiment(args)
+        readers = {"inspect_training_parameters": "parameters", "read_dataset_examples": "dataset_examples",
+            "read_validation_errors": "validation_errors", "compare_experiments": "compare", "get_experiment": "experiment"}
+        if name in readers:
+            self.guard()
+            return getattr(TrainingInspection(self), readers[name])(args)
+        if name == "answer_operator":
+            self.guard()
+            return self.service.answer_operator(self.run_id, args.request_id, args.answer,
+                instruction_action=args.instruction_action, instruction_key=args.instruction_key, sleep_minutes=args.sleep_minutes)
         if name == "read_chart":
             return self.read_chart(args)
         if name == "read_confusion_matrix":
-            return self.read_confusion_matrix(args.experiment_id)
-        if name == "get_experiment":
-            self.guard()
-            item, experiment = self._own(args.experiment_id)
-            detail = self.experiment_brief(item, experiment, full=True)
-            detail.update(curve=self.epoch_table(experiment.id, limit=300), resolved_parameters={key: value for key, value in (experiment.resolved_parameters or {}).items() if key not in {"project", "name", "exist_ok"}}, evaluation=self.evaluation_digest(experiment.id, samples=10))
-            return detail
+            return self.read_confusion_matrix(args.experiment_id, class_names=args.class_names, offset=args.offset, limit=args.limit)
         if name == "read_training_log":
             return self.read_log(args)
         if name == "suggest_parameters":
@@ -711,7 +793,7 @@ class WorkflowTools:
         if name == "stop_training":
             return self.stop_training(args.reason)
         if name == "resume_training":
-            return self.resume_training(args.experiment_id)
+            return self.resume_training(args.experiment_id, value_assessment=args.value_assessment, reason=args.reason)
         if name == "evaluate":
             return self.evaluate(args.experiment_id)
         return self.export_model(args)
@@ -765,6 +847,92 @@ class WorkflowTools:
         lines = [line.split("\r")[-1] for line in content.splitlines() if line.strip()]
         return {"task_id": tasks[-1].id, "status": tasks[-1].status, "log": "\n".join(lines[-args.lines:])}
 
+    def _resolve_candidate(self, args: StartArgs, pairs: list) -> tuple:
+        """预检和开训共用参数合并、首轮约束、数据和实验设计校验。"""
+        if pairs and args.value_assessment is None:
+            raise ValueError("后续训练必须提供 value_assessment：evidence 引用已有证据，expected_benefit 说明尚值得验证的假设，cost_tradeoff 权衡新增成本；没有有据可行的方向时可直接 finish，不必耗尽停滞轮数或预算。")
+        run, policy = self.service.get(self.run_id), self.policy()
+        parent_pair = self._own(args.parent_experiment_id) if args.parent_experiment_id else (pairs[-1] if pairs else None)
+        parent = parent_pair[1] if parent_pair else None
+        baseline = parent.parameters if parent else run.initial_parameters
+        change_model = self._parameter_model()
+        changes = change_model.model_validate(args.parameters).model_dump(exclude_none=True)
+        parameters = TrainingParameters.model_validate({**baseline, **changes})
+        # 继承值也必须满足当前运行范围，预检不能漏掉 Optuna adopt 的限制。
+        change_model.model_validate({name: value for name, value in parameters.model_dump().items() if name in change_model.model_fields})
+        if parameters.model not in self.prepared_models() or parameters.epochs > policy.max_epochs_per_experiment or parameters.max_training_imgsz() > policy.max_imgsz:
+            raise PermissionError("训练参数超出本运行的模型白名单或单实验上限")
+        if not pairs:
+            pinned = {field: run.initial_parameters[field] for field in run.state.get("operator_fields", [])}
+            if any(parameters.model_dump()[field] != value for field, value in pinned.items()):
+                raise ValueError(f"首轮必须使用操作者指定的参数：{pinned}，之后各轮才能调整")
+        exports = {item["dataset_export_id"] for item in self.allowed_exports()}
+        export_id = args.dataset_export_id or (parent.dataset_export_id if parent else run.dataset_export_id)
+        if export_id not in exports:
+            raise PermissionError("只能使用本项目内类别定义相同、已人审封存的数据工件")
+        design = comparison_design(parent, parameters.model_dump(), export_id)
+        validate_experiment_design(design, mode=args.comparison_mode, target=args.target_parameter, hypothesis=args.hypothesis)
+        return parameters, export_id, parent_pair, baseline, design
+
+    def _start_readiness(self, parent_pair) -> tuple[dict, list[str]]:
+        budget = self.service.budget(self.run_id)
+        blocked = []
+        if "train" not in self.policy().allowed_operations:
+            blocked.append("本次运行未授权训练")
+        if budget["experiments"] >= budget["max_experiments"]:
+            blocked.append("实验数预算已用完")
+        if budget["remaining_seconds"] < 1:
+            blocked.append("训练用时预算已耗尽")
+        own_active = self._active_training()
+        if own_active:
+            blocked.append("本运行已有训练在进行，需等待完成或停止后才能开新实验")
+        else:
+            with Session(self.engine) as session:
+                busy = session.scalar(select(TrainingTask.id).where(TrainingTask.resource_slot == "single-machine", TrainingTask.status.in_(ACTIVE)).limit(1))
+            if busy:
+                blocked.append("单机训练槽已有其它活跃任务，需等待槽位释放")
+        if parent_pair:
+            item, parent = parent_pair
+            evaluation = next((task for task in self._evaluations(parent.id) if task.id == item.evaluation_id and task.status == "completed"), None)
+            if parent.status != "completed" or evaluation is None or (item.conclusion or {}).get("map50_95") is None:
+                blocked.append("父实验尚无有效固定 val 结论；停止或失败的训练可使用 resume_training")
+            else:
+                try:
+                    self.report(evaluation.id)
+                except (DatasetError, PermissionError, ValueError, OSError) as error:
+                    blocked.append(f"父实验验证报告不可用：{error}")
+        return budget, blocked
+
+    def preview_experiment(self, args: StartArgs) -> dict:
+        """只读预检，不创建实验、Optuna 试验、任务或 GPU 计算。"""
+        self.guard("create_experiment")
+        pairs = self.iterations()
+        try:
+            parameters, export_id, parent_pair, _, design = self._resolve_candidate(args, pairs)
+        except (DatasetError, PermissionError, ValueError) as error:
+            return {"valid": False, "can_start": False, "errors": [str(error)[:2500]], "preview_only": True}
+        budget, blocked = self._start_readiness(parent_pair)
+        warnings = list(design["coupled_effects"])
+        if parameters.optimizer == "auto":
+            warnings.append("auto 优化器会覆盖 lr0 与 warmup_bias_lr；实际优化器和学习率须等训练器记录。")
+        if parameters.rect:
+            warnings.append("rect 模式可能关闭不兼容的混合增强，以实际生效配置为准。")
+        if parameters.close_mosaic >= parameters.epochs:
+            warnings.append("close_mosaic 不小于总 epochs，关闭时点可能落在开始或开始之前，请核对是否符合预期。")
+        if parameters.tile:
+            warnings.append("切片会增加实际样本与计算量，不能直接套用未切片实验的耗时。")
+        previous_matches = [{"experiment_id": experiment.id, "status": experiment.status, "val_map50_95": (item.conclusion or {}).get("map50_95")}
+            for item, experiment in pairs if experiment.dataset_export_id == export_id
+            and TrainingParameters.model_validate(experiment.parameters).model_dump() == parameters.model_dump()]
+        if previous_matches:
+            warnings.append("相同数据和完整参数曾被尝试；请先核对 previous_matches 的结果，只有明确的复验价值才继续，不能来回切换已试配置消耗预算。")
+        return {"valid": True, "can_start": not blocked, "blocking_reasons": blocked,
+            "parameters": parameters.model_dump(), "parent_experiment_id": parent_pair[1].id if parent_pair else None,
+            "dataset_export_id": export_id, "comparison": design, "warnings": warnings,
+            "previous_matches": previous_matches, "value_assessment": args.value_assessment.model_dump() if args.value_assessment else None,
+            "max_training_imgsz": parameters.max_training_imgsz(), "budget": budget,
+            "preview_only": True, "note": "预检不预留训练槽或预算；真正开训时重新校验。未估计显存或精度收益。"}
+
     def start_experiment(self, args: StartArgs, *, key: str) -> dict:
         """新建冻结参数的实验并启动训练；同一调用重放返回同一实验。
 
@@ -777,43 +945,18 @@ class WorkflowTools:
         pairs = self.iterations()
         existing = next((item for item, experiment in pairs if experiment.id == experiment_id), None)
         if existing is None:
-            run, policy = self.service.get(self.run_id), self.policy()
-            budget = self.service.budget(self.run_id)
-            if budget["experiments"] >= budget["max_experiments"]:
-                raise DatasetError(409, "实验数预算已用完，请导出已有模型或结束运行")
-            if budget["remaining_seconds"] < 1:
-                raise DatasetError(409, "训练用时预算已耗尽，请导出已有模型或结束运行")
-            if self._active_training():
-                raise DatasetError(409, "本运行已有训练在进行，请先等待完成或 stop_training")
-            parent_pair = self._own(args.parent_experiment_id) if args.parent_experiment_id else (pairs[-1] if pairs else None)
+            run = self.service.get(self.run_id)
+            parameters, export_id, parent_pair, baseline, design = self._resolve_candidate(args, pairs)
+            _, blocked = self._start_readiness(parent_pair)
+            if blocked:
+                raise DatasetError(409, "；".join(blocked))
             parent = parent_pair[1] if parent_pair else None
-            baseline = parent.parameters if parent else run.initial_parameters
-            changes = self._parameter_model().model_validate(args.parameters).model_dump(exclude_none=True)
-            parameters = TrainingParameters.model_validate({**baseline, **changes})
-            if parameters.model not in self.prepared_models() or parameters.epochs > policy.max_epochs_per_experiment or parameters.max_training_imgsz() > policy.max_imgsz:
-                raise PermissionError("训练参数超出本运行的模型白名单或单实验上限")
-            if not pairs:
-                pinned = {field: run.initial_parameters[field] for field in run.state.get("operator_fields", [])}
-                drift = {field: value for field, value in pinned.items() if parameters.model_dump()[field] != value}
-                if drift:
-                    raise ValueError(f"首轮必须使用操作者指定的参数：{pinned}，之后各轮才能调整")
-            exports = {item["dataset_export_id"] for item in self.allowed_exports()}
-            export_id = args.dataset_export_id or (parent.dataset_export_id if parent else run.dataset_export_id)
-            if export_id not in exports:
-                raise PermissionError("只能使用本项目内类别定义相同、已人审封存的数据工件")
-            design = comparison_design(parent, parameters.model_dump(), export_id)
-            validate_experiment_design(design, mode=args.comparison_mode, target=args.target_parameter, hypothesis=args.hypothesis)
-            if parent_pair:
-                parent_evaluation = next((task for task in self._evaluations(parent.id) if task.id == parent_pair[0].evaluation_id and task.status == "completed"), None)
-                if parent.status != "completed" or parent_evaluation is None or (parent_pair[0].conclusion or {}).get("map50_95") is None:
-                    raise ValueError("父实验尚无有效固定 val 结论，请先等待评估完成或结束；失败或被停止的训练请使用 resume_training")
-                self.report(parent_evaluation.id)
             iteration = len(pairs)
             study = self.study()
-            candidate = study.candidate(iteration, TrainingParameters.model_validate(baseline))
+            candidate = study.candidate(iteration, parameters if iteration == 0 else TrainingParameters.model_validate(baseline))
             number = study.adopt(iteration, candidate, parameters)
             experiment = self.training.create_experiment(ExperimentCreate(dataset_export_id=export_id, name=f"{run.name} · 第 {iteration + 1} 轮", parameters=parameters, parent_experiment_id=parent.id if parent else None, optimization_reason=args.reason), experiment_id=experiment_id)
-            plan = {"decision": "train", "reason": args.reason, "comparison_mode": args.comparison_mode, "target_parameter": args.target_parameter, "hypothesis": args.hypothesis, "comparison": design, "parameters": parameters.model_dump(), "dataset_export_id": export_id, "data_actions": [], "tool_call": key}
+            plan = {"decision": "train", "reason": args.reason, "comparison_mode": args.comparison_mode, "target_parameter": args.target_parameter, "hypothesis": args.hypothesis, "value_assessment": args.value_assessment.model_dump() if args.value_assessment else None, "comparison": design, "parameters": parameters.model_dump(), "dataset_export_id": export_id, "data_actions": [], "tool_call": key}
             with Session(self.engine) as session, session.begin():
                 session.add(AgentIteration(run_id=self.run_id, number=iteration, experiment_id=experiment.id, plan=plan, optuna_trial_number=number))
             self.service.event(self.run_id, "agent", "experiment_created", {"iteration": iteration, "experiment_id": experiment.id, "parent_experiment_id": experiment.parent_experiment_id, "plan": plan, "optuna_trial_number": number})
@@ -842,7 +985,7 @@ class WorkflowTools:
         self.service.event(self.run_id, "agent", "training_stop_requested", {"tasks": result, "reason": reason})
         return {"tasks": result, "note": "训练会在批次边界保存检查点后进入 stopped，可 resume_training 继续"}
 
-    def resume_training(self, experiment_id: str) -> dict:
+    def resume_training(self, experiment_id: str, *, value_assessment: TrainingValueAssessment | None = None, reason: str = "") -> dict:
         """从最近一次中断检查点继续，已在执行时直接返回现状。
 
         :param experiment_id: 本运行实验。
@@ -851,7 +994,14 @@ class WorkflowTools:
         self.guard("train")
         self._own(experiment_id)
         tasks = self._tasks(experiment_id)
-        task = tasks[-1] if tasks and tasks[-1].status in ACTIVE else self.train(experiment_id, resume=True)
+        if tasks and tasks[-1].status in ACTIVE:
+            task = tasks[-1]
+        else:
+            if value_assessment is None:
+                raise ValueError("恢复训练必须提供 value_assessment，先判断剩余训练是否仍有价值；不能仅因存在检查点就继续。")
+            task = self.train(experiment_id, resume=True)
+            self.service.event(self.run_id, "agent", "training_resume_assessed", {"experiment_id": experiment_id,
+                "task_id": task.id, "reason": reason, "value_assessment": value_assessment.model_dump()})
         return {"experiment_id": experiment_id, "task_id": task.id, "status": task.status, "resumed_from": task.parent_task_id}
 
     def evaluate(self, experiment_id: str) -> dict:

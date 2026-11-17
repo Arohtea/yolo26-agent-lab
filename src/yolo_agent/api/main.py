@@ -181,5 +181,5 @@ def runtime() -> RuntimeResponse:
     workers.sort(key=lambda item: item.runtime.collected_at, reverse=True)
     return RuntimeResponse(
         api=collect_runtime(settings.device), workers=workers,
-        latest_worker=workers[0] if workers else None, worker_report_error=error,
+        latest_worker=next((item for item in workers if item.runtime.effective_device.startswith("cuda")), workers[0] if workers else None), worker_report_error=error,
     )

@@ -31,7 +31,7 @@ services:
       timeout: 12s
       retries: 5
     restart: unless-stopped
-  worker:
+  worker: &task-worker
     image: yolo26-agent-lab-worker:cpu-0.1.0
     build:
       context: .
@@ -41,7 +41,7 @@ services:
     env_file:
       - path: .env
         required: false
-    environment:
+    environment: &task-worker-environment
       YOLO_DEVICE: ${YOLO_DEVICE:-auto}
       YOLO_REDIS_URL: redis://redis:6379/0
       YOLO_MLFLOW_TRACKING_URI: http://mlflow:5000
@@ -56,6 +56,19 @@ services:
         condition: service_healthy
     stop_grace_period: 30s
     restart: unless-stopped
+  annotation-worker:
+    <<: *task-worker
+    command: ["yolo-agent", "annotation-worker"]
+    stop_grace_period: 120s
+  data-worker:
+    <<: *task-worker
+    environment:
+      <<: *task-worker-environment
+      YOLO_QUEUE_NAME: ${YOLO_DATA_QUEUE_NAME:-yolo-data}
+      YOLO_DEVICE: cpu
+      OMP_NUM_THREADS: "4"
+      MKL_NUM_THREADS: "4"
+    stop_grace_period: 120s
   agent-controller:
     image: yolo26-agent-lab-api:0.1.0
     build:

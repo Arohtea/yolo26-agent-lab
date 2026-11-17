@@ -10,7 +10,9 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from yolo_agent.models.agent import AgentEvent, AgentIteration, AgentRun
-from yolo_agent.schemas.agent import AgentResume, AgentRunCreate, AgentRunRead, TrainingSetup
+from yolo_agent.models.annotation import AnnotationRun, ClassSchema, DatasetExport
+from yolo_agent.models.dataset import Dataset, DatasetVersion, Project
+from yolo_agent.schemas.agent import AgentOperatorMessage, AgentResume, AgentRunCreate, AgentRunRead, AgentWake, OperatorInstructionRead, OperatorInstructionRevoke, TrainingPromptDraft, TrainingPromptOptimize, TrainingSetup
 from yolo_agent.services.agents import AgentService
 from yolo_agent.services.datasets import DatasetError, owned_path
 from yolo_agent.settings import get_settings
@@ -25,6 +27,31 @@ def agent_service(request: Request) -> AgentService:
     :returns: 不执行长计算的 Agent 服务。
     """
     return AgentService(request.app.state.engine,get_settings())
+
+
+@router.post("/training-prompts/optimize", response_model=TrainingPromptDraft)
+def optimize_prompt(data: TrainingPromptOptimize, service: AgentService = Depends(agent_service)):
+    """仅润色需求文本并返回建议，不写库、不创建流程或训练任务。"""
+    from yolo_agent.agents.planner import optimize_training_prompt
+
+    with Session(service.engine) as session:
+        project = session.get(Project, data.project_id)
+        if project is None:
+            raise DatasetError(404, "项目不存在")
+        context = {"project_name": project.name, "operator_parameters": data.initial_parameters.model_dump(exclude_unset=True), "policy": data.policy.model_dump(), "model_locked": len(data.policy.allowed_models) == 1}
+        if data.dataset_export_id:
+            row = session.execute(select(Dataset, ClassSchema).select_from(DatasetExport)
+                .join(DatasetVersion, DatasetExport.version_id == DatasetVersion.id)
+                .join(Dataset, DatasetVersion.dataset_id == Dataset.id)
+                .join(AnnotationRun, DatasetExport.run_id == AnnotationRun.id)
+                .join(ClassSchema, AnnotationRun.class_schema_id == ClassSchema.id)
+                .where(DatasetExport.id == data.dataset_export_id, Dataset.project_id == project.id,
+                    Dataset.deleted_at.is_(None), ClassSchema.project_id == project.id)).first()
+            if row is None:
+                raise DatasetError(404, "所选训练数据不存在或不属于当前项目")
+            dataset, schema = row
+            context["dataset"] = {"name": dataset.name, "classes": [{"class_id": item["class_id"], "name": item["name"]} for item in schema.classes]}
+    return optimize_training_prompt(service.settings, data.requirement, context)
 
 
 @router.post("/agent-runs",response_model=AgentRunRead,status_code=202)
@@ -75,6 +102,31 @@ def run_budget(run_id: str,service: AgentService=Depends(agent_service)):
     :returns: 实验数、用时和剩余预算。
     """
     return service.budget(run_id)
+
+
+@router.post("/agent-runs/{run_id}/wake", response_model=AgentRunRead, status_code=202)
+def wake_run(run_id: str, data: AgentWake, service: AgentService = Depends(agent_service)):
+    """提交立即唤醒请求及可选问题，由现有控制器恢复同一检查点。"""
+    return service.wake(run_id, data.question, sleep_until=data.sleep_until)
+
+
+@router.get("/agent-runs/{run_id}/operator-messages", response_model=list[AgentOperatorMessage])
+def operator_messages(run_id: str, service: AgentService = Depends(agent_service)):
+    """读取最近十次唤醒请求与回答，独立于长流程事件分页。"""
+    service.get(run_id)
+    return service.operator_messages(run_id)
+
+
+@router.get("/agent-runs/{run_id}/operator-instructions", response_model=list[OperatorInstructionRead])
+def operator_instructions(run_id: str, service: AgentService = Depends(agent_service)):
+    """当前流程的持续指令，独立于问答分页与检查点摘要。"""
+    return service.operator_instructions(run_id)
+
+
+@router.post("/agent-runs/{run_id}/operator-instructions/{key}/revoke")
+def revoke_operator_instruction(run_id: str, key: str, data: OperatorInstructionRevoke, service: AgentService = Depends(agent_service)):
+    """只撤销操作者看到的指令版本，不覆盖后来提交的新要求。"""
+    return service.revoke_operator_instruction(run_id, key, data.instruction_id)
 
 
 @router.post("/agent-runs/{run_id}/pause",response_model=AgentRunRead)

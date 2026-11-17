@@ -7,6 +7,7 @@ RUN apt-get update \
 COPY pyproject.toml ./
 COPY src ./src
 COPY scripts ./scripts
+COPY docs/skills ./docs/skills
 RUN pip install --no-cache-dir . \
     && python scripts/install_torch.py --flavor ${TORCH_FLAVOR} --allow-system-python \
     && pip install --no-cache-dir '.[training,evaluation,agent,export]'

@@ -49,7 +49,7 @@ class GroundingDetector:
                     raise RuntimeError(f"本地模型文件指纹不符：{name}")
         self.processor = AutoProcessor.from_pretrained(path, local_files_only=True, trust_remote_code=False)
         self.model = AutoModelForZeroShotObjectDetection.from_pretrained(path, local_files_only=True, trust_remote_code=False, use_safetensors=True).to(self.device).eval()
-        torch.set_num_threads(min(torch.get_num_threads(), 4))
+        torch.set_num_threads(min(torch.get_num_threads(), settings.annotation_cpu_threads))
 
     def detect(self, path: Path, classes: list[dict], policy: dict) -> list[dict]:
         """对 EXIF 校正后的像素推理，保存所有候选的审核风险标记。

@@ -22,6 +22,7 @@ from yolo_agent.schemas.dataset import ImageRead
 from yolo_agent.services.annotations import annotation_digest
 from yolo_agent.services.dataset_transfer import ignored_file, upload_name
 from yolo_agent.services.datasets import DatasetService, owned_path
+from yolo_agent.services.task_control import require_running
 from yolo_agent.services.inspector import FORMATS, analyze_images, inspect_image, encoded_image_suffix
 from yolo_agent.workers.dataset_tasks import _write_json
 
@@ -31,7 +32,7 @@ def file_digest(path: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def prepare_yolo_source(settings, task_id: str, parameters: dict) -> tuple[Path, dict, list]:
+def prepare_yolo_source(settings, task_id: str, parameters: dict, *, progress=None) -> tuple[Path, dict, list]:
     """只接受包内的标准检测布局；忽略来源机器 data.yaml 的绝对 path。"""
     source = owned_path(settings, parameters["source"])
     if parameters["archive"]:
@@ -41,7 +42,10 @@ def prepare_yolo_source(settings, task_id: str, parameters: dict) -> tuple[Path,
         with ZipFile(source / "dataset.zip") as archive:
             if len(archive.infolist()) > settings.max_dataset_images * 3 + 500:
                 raise ValueError("ZIP 内文件数超过限制")
-            for entry in archive.infolist():
+            entries = archive.infolist()
+            for index, entry in enumerate(entries, 1):
+                if progress and (index == 1 or index % 50 == 0 or index == len(entries)):
+                    progress("extracting_archive", completed_files=index - 1, total_files=len(entries))
                 path = upload_name(entry.filename.rstrip("/") if entry.is_dir() else entry.filename)
                 if stat.S_ISLNK(entry.external_attr >> 16) or entry.flag_bits & 1:
                     raise ValueError("ZIP 不接受符号链接或加密文件")
@@ -125,6 +129,8 @@ def prepare_yolo_source(settings, task_id: str, parameters: dict) -> tuple[Path,
             label_target.write_text(label.read_text(encoding="utf-8-sig"), encoding="utf-8")
             members.append({"stem": stem, "name": image.relative_to(root).as_posix(), "split": split,
                 "extension_corrected": suffix != image.suffix.lower(), "mpo_primary_frame": encoding == "MPO"})
+            if progress and len(members) % 25 == 0:
+                progress("normalizing_labels", completed_images=len(members))
     if not members or len(members) > settings.max_dataset_images:
         raise ValueError("数据包为空或图片数超过数据集限制")
     orphan_labels = {p for p in root.rglob("*.txt") if "labels" in p.relative_to(root).parts and not ignored_file(p.relative_to(root))} - used_labels
@@ -137,7 +143,16 @@ def prepare_yolo_source(settings, task_id: str, parameters: dict) -> tuple[Path,
 
 
 def import_labeled(engine, settings, task_id: str, dataset_id: str, parameters: dict) -> dict:
-    view, names, source_members = prepare_yolo_source(settings, task_id, parameters)
+    def report(stage, completed_images=0, total_images=0, **details):
+        with Session(engine) as session, session.begin():
+            task = session.get(DatasetTask, task_id)
+            require_running(task)
+            task.processed = completed_images
+            task.result = {"progress": {"stage": stage, "completed_images": completed_images,
+                "total_images": total_images, "estimated": False, **details}}
+    report("preparing_source")
+    view, names, source_members = prepare_yolo_source(settings, task_id, parameters, progress=report)
+    report("parsing_labels", total_images=len(source_members))
     imported = dm.Dataset.import_from(str(view), format="yolo")
     categories = imported.categories()[dm.AnnotationType.label].items
     if [c.name for c in categories] != list(names.values()):
@@ -146,11 +161,11 @@ def import_labeled(engine, settings, task_id: str, dataset_id: str, parameters: 
     if len(items) != len(source_members):
         raise ValueError("Datumaro 解析图片数量与来源不一致")
     sources = {m["stem"]: m for m in source_members}
-    reviewed = parameters.get("accepted_reviewed_source", False)
+    reviewed = parameters.get("accepted_reviewed_source", True)
     attribution = {"source": "external_labeled_yolo", "reviewer": parameters.get("reviewer", ""),
         "confirmation": parameters.get("confirmation", ""), "accepted_reviewed_source": reviewed,
         "accepted_at": utc_now(), "new_manual_review_performed": False}
-    schema_id, version_id, run_id = new_id(), new_id(), new_id()
+    schema_id, version_id, run_id = new_id(), task_id, new_id()
     images, members, boxes, reviews, events, clipping = [], [], [], [], [], []
     counts, splits = Counter(), Counter()
     with Session(engine) as session, session.begin():
@@ -170,7 +185,8 @@ def import_labeled(engine, settings, task_id: str, dataset_id: str, parameters: 
         if not path.is_relative_to(view.resolve()):
             raise ValueError("解析媒体路径越界")
         identity = new_id()
-        preview = f"previews/{identity}.jpg"
+        preview = f"previews/imports/{task_id}/{identity}.jpg"
+        owned_path(settings, preview).parent.mkdir(parents=True, exist_ok=True)
         info = inspect_image(path, owned_path(settings, preview), settings.max_image_pixels, allow_mpo_primary_frame=True)
         if info["status"] != "valid":
             raise ValueError(f"图片未通过检查：{source['name']} {info.get('error')}")
@@ -196,7 +212,7 @@ def import_labeled(engine, settings, task_id: str, dataset_id: str, parameters: 
             box = Annotation(id=new_id(), run_id=run_id, image_id=identity, class_id=annotation.label,
                 class_name=names[annotation.label], bbox=bounded.tolist(), confidence=None,
                 annotation_source="external_labeled_yolo", annotation_model_version="operator-upload",
-                review_status="approved" if reviewed and not clipped else "pending",
+                review_status="approved" if reviewed else "pending",
                 flags=["boundary_clipped_on_import"] if clipped else [], reviewer=attribution["reviewer"] if reviewed else None)
             image_boxes.append(box)
             before.append({"class_id": annotation.label, "bbox": original.tolist()})
@@ -212,16 +228,21 @@ def import_labeled(engine, settings, task_id: str, dataset_id: str, parameters: 
                 after=[{"class_id": b.class_id, "bbox": b.bbox, "status": b.review_status, "authorization": attribution} for b in image_boxes]))
         splits[split] += 1
         with Session(engine) as session, session.begin():
-            session.get(DatasetTask, task_id).processed = index
+            task = session.get(DatasetTask, task_id)
+            require_running(task)
+            task.processed = index
+            task.result = {"progress": {"stage": "checking_images", "completed_images": index,
+                "total_images": len(items), "estimated": False}}
     pending = sum(r.status == "pending" for r in reviews)
     ready = pending == 0
+    report("analyzing_dataset", len(members), len(members))
     quality, _ = analyze_images(members, 4, settings.max_similarity_pairs)
     summary = {"image_count": len(members), "annotation_count": len(boxes), "split_counts": {s: splits[s] for s in ("train", "val", "test")},
         "class_distribution": dict(counts), "reviewed_images": len(members) - pending, "unreviewed_images": pending,
         "ready_for_training": ready, "source_split_preserved": True, "clipped_boxes": len(clipping),
         "corrected_extensions": sum(m["extension_corrected"] for m in source_members),
         "mpo_primary_frames": sum(m["mpo_primary_frame"] for m in source_members),
-        "warnings": ["保留来源划分，未重新去重；请关注相邻帧跨集造成的数据泄漏"] + (["越界框已裁剪，受影响图片须重新审核"] if clipping else [])}
+        "warnings": ["保留来源划分，未重新去重；请关注相邻帧跨集造成的数据泄漏"] + (["越界框已按图片边界规范化，保留原始坐标与外部审核来源"] if clipping else [])}
     quality.update(annotation_status="external_reviewed" if ready else "pending_review", class_distribution=dict(counts),
         class_distribution_reason="来自上传的 YOLO 标签", ready_for_training=ready)
     relative = f"versions/{version_id}/manifest.json"
@@ -233,6 +254,7 @@ def import_labeled(engine, settings, task_id: str, dataset_id: str, parameters: 
     _write_json(owned_path(settings, report), {**result, "clipped_boxes": clipping, "review_attribution": attribution})
     # 图片、版本、框和审核凭据一次提交；坏标签不会留下半个可用版本。
     with Session(engine) as session, session.begin():
+        require_running(session.get(DatasetTask, task_id))
         session.add_all(images)
         session.add(ClassSchema(id=schema_id, project_id=project_id, name=f"上传 YOLO 类别 · {version_id[:8]}", classes=classes))
         session.flush()
@@ -250,7 +272,31 @@ def import_labeled(engine, settings, task_id: str, dataset_id: str, parameters: 
         session.flush()
         session.add_all(boxes + reviews + events)
         task = session.get(DatasetTask, task_id)
-        task.result, task.report_path, task.status, task.finished_at = result, report, "completed", utc_now()
+        task.result, task.report_path = result, report
+    if ready:
+        # 复用已审封存器；上传者已声明审核完成，直接提供训练数据，不另建训练流程。
+        from yolo_agent.workers.annotation_tasks import _export_dataset
+        def progress(stage, completed_images=0, **details):
+            with Session(engine) as session, session.begin():
+                task = session.get(DatasetTask, task_id)
+                if task.status != "running":
+                    raise ValueError("导入已停止，取消后续封存")
+                task.result = {**result, "progress": {"stage": stage, "completed_images": completed_images,
+                    "total_images": len(members), "estimated": False, **details}}
+        export_result, export_record = _export_dataset(engine, settings, run_id, members, classes, progress=progress)
+        with Session(engine) as session, session.begin():
+            require_running(session.get(DatasetTask, task_id))
+            session.add(export_record)
+            session.get(AnnotationRun, run_id).status = "exported"
+            result["dataset_export_id"] = export_record.id
+            session.get(DatasetTask, task_id).result = result
+    with Session(engine) as session, session.begin():
+        task = session.get(DatasetTask, task_id)
+        require_running(task)
+        task.result, task.status, task.finished_at = result, "completed", utc_now()
+    _write_json(owned_path(settings, report), {**result, "clipped_boxes": clipping, "review_attribution": attribution})
+    from yolo_agent.services.garbage import collect_task_garbage
+    collect_task_garbage(engine, settings, task_id)
     return result
 
 
@@ -258,7 +304,16 @@ def export_dataset(engine, settings, task_id: str, parameters: dict) -> dict:
     """普通导出保留待审核标注，与已审核训练工件严格分开。"""
     from yolo_agent.workers.annotation_tasks import _prepare_frames, _verify_image
 
+    def report_progress(stage, completed_images=0):
+        with Session(engine) as session, session.begin():
+            task = session.get(DatasetTask, task_id)
+            require_running(task)
+            task.processed = completed_images
+            task.result = {"progress": {"stage": stage, "completed_images": completed_images,
+                "total_images": task.total, "estimated": False}}
+
     version_id, run_id = parameters["version_id"], parameters.get("run_id")
+    report_progress("validating_version")
     DatasetService(engine, settings).manifest_path(version_id)
     with Session(engine) as session:
         members = list(session.scalars(select(VersionImage.snapshot).where(VersionImage.version_id == version_id).order_by(VersionImage.image_id)))
@@ -277,9 +332,15 @@ def export_dataset(engine, settings, task_id: str, parameters: dict) -> dict:
         session.get(DatasetTask, task_id).total = len(members)
     target = owned_path(settings, f"dataset-downloads/{task_id}")
     # 无旋转的原图直接交给 Datumaro 复制，避免把大型航拍 JPEG 全部膨胀成 PNG。
-    frames_by_id = {m["id"]: _verify_image(settings, m) for m in members if m.get("exif_orientation", 1) in {None, 1}}
+    frames_by_id = {}
+    for index, member in enumerate(members, 1):
+        if member.get("exif_orientation", 1) in {None, 1}:
+            frames_by_id[member["id"]] = _verify_image(settings, member)
+        if index % 25 == 0 or index == len(members):
+            report_progress("export_preparing_images", index)
     rotated = [m for m in members if m.get("exif_orientation", 1) not in {None, 1}]
     frames_by_id.update({p.stem: p for p in _prepare_frames(settings, f"download-{task_id}", rotated)})
+    report_progress("export_writing_dataset", len(members))
     grouped = defaultdict(list)
     for box in boxes:
         x1, y1, x2, y2 = box.bbox
@@ -312,13 +373,17 @@ def export_dataset(engine, settings, task_id: str, parameters: dict) -> dict:
         "reviews": [{"image_id": r.image_id, "status": r.status, "missed_objects_checked": r.missed_objects_checked, "reviewer": r.reviewer, "reviewed_at": r.reviewed_at} for r in reviews],
         "review_attribution": provenance,
         "sha256": {p.relative_to(target).as_posix(): file_digest(p) for p in sorted(target.rglob("*")) if p.is_file()}})
+    report_progress("export_archiving", len(members))
     archive = Path(shutil.make_archive(str(target), "zip", root_dir=target))
+    report_progress("export_verifying_archive", len(members))
     result = {"version_id": version_id, "run_id": run_id, "summary": summary,
         "archive_path": archive.relative_to(settings.storage_dir.resolve()).as_posix(), "archive_sha256": file_digest(archive)}
     report = f"reports/dataset-export-{task_id}.json"
     _write_json(owned_path(settings, report), result)
     with Session(engine) as session, session.begin():
         task = session.get(DatasetTask, task_id)
+        require_running(task)
         task.result, task.report_path, task.status, task.finished_at, task.processed = result, report, "completed", utc_now(), len(members)
-    shutil.rmtree(owned_path(settings, f"annotations/download-{task_id}"), ignore_errors=True)
+    from yolo_agent.services.garbage import collect_task_garbage
+    collect_task_garbage(engine, settings, task_id)
     return result

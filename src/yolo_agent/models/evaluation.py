@@ -10,12 +10,13 @@ class EvaluationTask(Base):
     """模型、数据与评估参数明确绑定，报告以独立文件保存。"""
 
     __tablename__ = "evaluation_tasks"
-    __table_args__ = (Index("uq_active_model_evaluation", "model_id", unique=True, sqlite_where=text("status IN ('queued','running')")),)
+    __table_args__ = (Index("uq_active_model_evaluation", "model_id", unique=True, sqlite_where=text("status IN ('queued','running','canceling')")),)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     experiment_id: Mapped[str] = mapped_column(ForeignKey("experiments.id"), index=True)
     model_id: Mapped[str] = mapped_column(ForeignKey("model_registry.id"))
     dataset_export_id: Mapped[str] = mapped_column(ForeignKey("dataset_exports.id"))
     status: Mapped[str] = mapped_column(default="queued")
+    stop_requested: Mapped[bool] = mapped_column(default=False)
     parameters: Mapped[dict] = mapped_column(JSON)
     execution_limits: Mapped[dict] = mapped_column(JSON,default=dict)
     summary: Mapped[dict | None] = mapped_column(JSON)

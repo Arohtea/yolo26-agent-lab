@@ -29,8 +29,8 @@ def fail_evaluation(engine: Engine, task_id: str, reason: str) -> None:
     """
     with Session(engine) as session, session.begin():
         task = session.get(EvaluationTask, task_id)
-        if task and task.status in {"queued", "running"}:
-            task.status, task.error, task.finished_at = "failed", reason[:4000], utc_now()
+        if task and task.status in {"queued", "running", "canceling"}:
+            task.status, task.error, task.finished_at = ("stopped" if task.stop_requested else "failed"), ("操作者终止评估" if task.stop_requested else reason[:4000]), utc_now()
 
 
 class EvaluationService:
@@ -92,7 +92,7 @@ class EvaluationService:
             if task is None:
                 raise DatasetError(404, "评估任务不存在")
             reason = None
-            if task.status in {"queued", "running"}:
+            if task.status in {"queued", "running", "canceling"}:
                 try:
                     with redis_connection(self.settings) as connection:
                         job = Job.fetch(task_id, connection=connection, serializer=JSONSerializer)
@@ -106,6 +106,8 @@ class EvaluationService:
             if reason:
                 session.close()
                 fail_evaluation(self.engine, task_id, reason)
+                from yolo_agent.services.garbage import collect_evaluation_garbage
+                collect_evaluation_garbage(self.engine, self.settings, task_id)
                 return self.get(task_id)
             session.expunge(task)
             return task

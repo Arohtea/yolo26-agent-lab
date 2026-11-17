@@ -23,6 +23,11 @@ logger = logging.getLogger(__name__)
 SUFFIX = {"onnx": "onnx", "torchscript": "torchscript"}
 
 
+def on_export_stopped(job, connection) -> None:
+    """RQ 停止回调立即清理未交付的转换中间文件。"""
+    on_export_failure(job, connection, RuntimeError, "操作者终止导出", None)
+
+
 def on_export_failure(job, connection, exc_type, exc_value, traceback) -> None:
     """进程异常或超时也要把导出记录置为失败。
 
@@ -33,9 +38,12 @@ def on_export_failure(job, connection, exc_type, exc_value, traceback) -> None:
     :param traceback: 异常堆栈。
     :returns: 无。
     """
-    engine = create_database_engine(get_settings())
+    settings = get_settings()
+    engine = create_database_engine(settings)
     try:
         fail_export(engine, job.id, f"{getattr(exc_type,'__name__',str(exc_type))}: {exc_value}")
+        from yolo_agent.services.garbage import collect_export_garbage
+        collect_export_garbage(engine, settings, job.id)
     finally:
         engine.dispose()
 
@@ -97,6 +105,13 @@ def run_export_task(export_id: str) -> dict:
             fmt, kind, model_id, weight, digest = record.format, model.kind, model.id, model.path, model.sha256
             imgsz = int(experiment.parameters["imgsz"])
         source = owned_path(settings, weight)
+        def progress(stage):
+            from yolo_agent.services.task_control import require_running
+            with Session(engine) as session, session.begin():
+                current = session.get(ModelExport, export_id)
+                require_running(current)
+                current.verification = {"progress": stage}
+        progress("verifying_weights")
         if not source.is_file() or _hash(source) != digest:
             raise DatasetError(409, "注册权重缺失或指纹变化")
         output = owned_path(settings, f"model_exports/{export_id}")
@@ -106,6 +121,7 @@ def run_export_task(export_id: str) -> dict:
         shutil.copy2(source, work)
         work.chmod(0o644)
         with (output / "export.log").open("a", buffering=1, encoding="utf-8") as log, redirect_stdout(log), redirect_stderr(log):
+            progress("converting")
             configure_ultralytics(settings)
             from ultralytics import YOLO
 
@@ -113,6 +129,7 @@ def run_export_task(export_id: str) -> dict:
             options = {"simplify": True, "dynamic": False} if fmt == "onnx" else {}
             produced = Path(YOLO(str(work)).export(format=fmt, imgsz=imgsz, device="cpu", **options))
         work.unlink(missing_ok=True)
+        progress("verifying_runtime")
         verification = _verify(fmt, produced, imgsz)
         final = output / f"{kind}-{model_id[:8]}.{SUFFIX[fmt]}"
         produced.replace(final)
@@ -120,12 +137,16 @@ def run_export_task(export_id: str) -> dict:
         result = {"path": final.relative_to(settings.storage_dir.resolve()).as_posix(), "sha256": _hash(final), "size_bytes": final.stat().st_size, "verification": verification}
         with Session(engine) as session, session.begin():
             record = session.get(ModelExport, export_id)
+            from yolo_agent.services.task_control import require_running
+            require_running(record)
             record.status, record.finished_at = "completed", utc_now()
             record.path, record.sha256, record.size_bytes, record.verification = result["path"], result["sha256"], result["size_bytes"], verification
         logger.info("模型格式导出完成", extra={"task_id": export_id, "result": result})
         return {"export_id": export_id, "format": fmt, **result}
     except Exception as error:
         fail_export(engine, export_id, f"{type(error).__name__}: {error}")
+        from yolo_agent.services.garbage import collect_export_garbage
+        collect_export_garbage(engine, settings, export_id)
         logger.exception("模型格式导出失败", extra={"task_id": export_id})
         raise
     finally:

@@ -68,7 +68,9 @@ class AnnotationService:
 
     def _commit_task(self, task_id: str) -> DatasetTask:
         try:
-            enqueue_annotation_task(self.settings, task_id)
+            with Session(self.engine) as session:
+                cpu_only = session.get(DatasetTask, task_id).kind != "auto_annotate"
+            enqueue_annotation_task(self.settings, task_id, cpu_only=cpu_only)
         except Exception as exc:
             fail_dataset_task(self.engine, task_id, f"队列提交失败：{type(exc).__name__}")
             with Session(self.engine) as session, session.begin():

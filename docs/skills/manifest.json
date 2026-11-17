@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "repository": "https://github.com/ultralytics/skills",
+  "revision": "11e45578024f8bcfdcf1ff3faf2d9e8a80e3c919",
+  "license": "AGPL-3.0",
+  "skills": {
+    "yolo": {
+      "files": {
+        "SKILL.md": "b98995db3e8c20c4b49207a44506f68bc7042f9b29dc521b6535d635d8b9c32e"
+      }
+    },
+    "yolo-training": {
+      "files": {
+        "SKILL.md": "79f1982a1a0505f335f963a408cddd9fdafc956b7944abea5e966d850c96d10b",
+        "training-args.md": "7e5adc369b4fc50ccd099e53895fdf6cb5743499b3f940fc642ebd32843cd5e6"
+      }
+    },
+    "yolo-tuning": {
+      "files": {
+        "SKILL.md": "192e8a80fed689a5e2c6b19f9894a6ca14f3347fffaaa26ebf23d1b6fb412887"
+      }
+    },
+    "yolo-datasets": {
+      "files": {
+        "SKILL.md": "bc91d9cede69199c62b8cf75f93114b4cdceddb3deacef78fbd4963765487653",
+        "label-formats.md": "a7ca19159bc2170ed95774b5de2485b450abc493d08a382b642dae6445c4282e"
+      }
+    },
+    "yolo-models": {
+      "files": {
+        "SKILL.md": "6b3d8ccd231a1c5c18dcff44781d00d32e3ce904153598c96d2ad8f78b2df966",
+        "weights-catalog.md": "1376907555146b4507e5bf0a4625f16da4c22ec37421b0d4e8eb05c1f1789795"
+      }
+    },
+    "yolo-export": {
+      "files": {
+        "SKILL.md": "76c316565a0264a3e24508c50dfd27f0d7e00e4da6326ad1a1749a3ede70a23f",
+        "format-matrix.md": "5349b8d372ad53eeb28c3b3e206c06f6d5da48e4ea1630858774f30607b1fa58"
+      }
+    }
+  }
+}

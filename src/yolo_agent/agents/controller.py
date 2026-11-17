@@ -4,16 +4,14 @@ import logging
 import signal
 import sqlite3
 import threading
+import time
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
-from rq.command import send_stop_job_command
-from rq.exceptions import NoSuchJobError
-from rq.job import Job
-from rq.serializers import JSONSerializer
+from rq import Worker
 from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
@@ -23,10 +21,8 @@ from yolo_agent.models.agent import AgentIteration, AgentRun
 from yolo_agent.models.database import create_database_engine
 from yolo_agent.models.dataset import DatasetTask, utc_now
 from yolo_agent.models.evaluation import EvaluationTask
-from yolo_agent.models.experiment import TrainingTask
+from yolo_agent.models.experiment import ModelExport, TrainingTask
 from yolo_agent.services.agents import AgentService
-from yolo_agent.services.datasets import fail_dataset_task
-from yolo_agent.services.evaluation import fail_evaluation
 from yolo_agent.settings import Settings
 from yolo_agent.tools.workflow import WorkflowPaused, WorkflowStopped, WorkflowTools
 from yolo_agent.utils.logging import configure_logging
@@ -52,6 +48,7 @@ class AgentController:
         self.engine=create_database_engine(settings)
         self.service=AgentService(self.engine,settings)
         self.owner=str(uuid4())
+        self.last_gc = 0.0
 
     def _training_tasks(self, run_id: str):
         with Session(self.engine) as session:
@@ -70,45 +67,79 @@ class AgentController:
         run=self.service.get(run_id)
         waiting=run.state.get("waiting",{})
         kind,task_id=waiting.get("kind"),waiting.get("task_id")
-        if kind not in {"dataset","evaluation"} or not task_id:
-            return False
+        references = set()
         with Session(self.engine) as session:
-            task=session.get(DatasetTask if kind=="dataset" else EvaluationTask,task_id)
-            if task is None or task.status not in {"queued","running"}:
-                return False
-            if kind=="evaluation":
-                owned=session.scalar(select(AgentIteration.run_id).where(AgentIteration.run_id==run_id,AgentIteration.experiment_id==task.experiment_id))
-            else:
-                tools=WorkflowTools(self.service,run_id)
-                owned=task.dataset_id==run.dataset_id and (task.id in {tools.identity("analysis"),tools.identity("split")} or task.parameters.get("run_id")==run.state.get("annotation_run_id"))
-            if not owned:
-                raise PermissionError("不能取消非本运行提交的任务")
-        with redis_connection(self.settings) as connection:
+            experiments=select(AgentIteration.experiment_id).where(AgentIteration.run_id==run_id)
+            references.update(("evaluation",identity) for identity in session.scalars(select(EvaluationTask.id).where(
+                EvaluationTask.experiment_id.in_(experiments),EvaluationTask.status.in_(["queued","running","canceling"]))))
+            references.update(("export",identity) for identity in session.scalars(select(ModelExport.id).where(
+                ModelExport.requested_by==f"agent:{run_id}",ModelExport.status.in_(["queued","running","canceling"]))))
+            if kind=="dataset" and task_id:
+                task=session.get(DatasetTask,task_id)
+                if task and task.status in {"queued","running","canceling"}:
+                    tools=WorkflowTools(self.service,run_id)
+                    owned=task.dataset_id==run.dataset_id and (task.id in {tools.identity("analysis"),tools.identity("split")} or task.parameters.get("run_id")==run.state.get("annotation_run_id"))
+                    if not owned:
+                        raise PermissionError("不能取消非本运行提交的任务")
+                    references.add(("dataset",task_id))
+        from yolo_agent.services.task_control import cancel_task
+        pending=False
+        for kind,identity in references:
+            result=cancel_task(self.engine,self.settings,kind,identity,stop_flow=run.stop_requested)
+            pending=pending or result["status"]=="canceling"
+        return pending
+
+    def _renew_lease(self, run_id: str, done: threading.Event) -> None:
+        """模型请求和图内重试可能超过五分钟，执行期间定期续租。"""
+        while not done.wait(30):
             try:
-                job=Job.fetch(task_id,connection=connection,serializer=JSONSerializer)
-                if job.get_status(refresh=True)=="started":
-                    send_stop_job_command(connection,task_id)
-                    return True
-                job.cancel()
-            except NoSuchJobError:
-                pass
-        if kind=="dataset":
-            fail_dataset_task(self.engine,task_id,"操作者停止 Agent 流程")
-        else:
-            fail_evaluation(self.engine,task_id,"操作者停止 Agent 流程")
-        return False
+                with Session(self.engine) as session,session.begin():
+                    changed=session.execute(update(AgentRun).where(AgentRun.id==run_id,
+                        AgentRun.lease_owner==self.owner).values(lease_until=_time_after(300)))
+                    if not changed.rowcount:
+                        return
+            except Exception:
+                logger.warning("Agent 续租暂时失败，将在下一周期重试",exc_info=True)
 
     def _ready(self, run_id: str, payload: dict) -> bool | str:
         """判断中断是否可以恢复；休眠类返回唤醒原因，交给模型作为工具结果。"""
         kind=payload.get("kind")
         tools=WorkflowTools(self.service,run_id)
+        if kind=="finish_tasks":
+            from yolo_agent.services.task_control import cancel_task
+            getters={"training":tools.training.get_task,"evaluation":tools.evaluation.get,"export":tools.exports.get}
+            pending=False
+            for ref in payload.get("watch",[]):
+                task=getters[ref["kind"]](ref["id"])
+                if task.status=="queued" and (datetime.now(timezone.utc)-datetime.fromisoformat(task.created_at)).total_seconds()>self.settings.agent_queue_wait_seconds:
+                    queue_name=self.settings.data_queue_name if ref["kind"]=="export" else self.settings.queue_name
+                    if ref["kind"]!="training" and not self._queue_busy(queue_name):
+                        cancel_task(self.engine,self.settings,ref["kind"],ref["id"],stop_flow=False)
+                        task=getters[ref["kind"]](ref["id"])
+                        self.service.event(run_id,"best_model_selection","finish_task_unavailable",{"kind":ref["kind"],"task_id":ref["id"],"message":"收尾任务排队超时，已撤销并保留现有结果"},level="warning")
+                pending=pending or task.status in {"queued","running","canceling"}
+            return not pending
         if kind=="dataset":
             task=tools.datasets.get_task(payload["task_id"])
             if task.status=="queued" and (datetime.now(timezone.utc)-datetime.fromisoformat(task.created_at)).total_seconds()>self.settings.agent_queue_wait_seconds:
+                # 兼容升级前已排队任务：以 RQ Job 实际来源为准，而非假定新路由。
+                from rq.job import Job
+                from rq.serializers import JSONSerializer
+                from rq.exceptions import NoSuchJobError
+                queue_name = self.settings.annotation_queue_name if task.kind == "auto_annotate" else self.settings.data_queue_name
+                with redis_connection(self.settings) as connection:
+                    try:
+                        queue_name = Job.fetch(task.id, connection=connection, serializer=JSONSerializer).origin or queue_name
+                    except NoSuchJobError:
+                        pass
+                if self._queue_busy(queue_name):
+                    return False  # 真实 Worker 正在处理上一项工作，继续排队，不误报故障。
                 self._cancel_pending(run_id)
                 raise TimeoutError("任务排队超过等待上限，已撤销计算，等待人工检查 Worker")
             return task.status not in {"queued","running","canceling"}
         if kind=="sleep":
+            if self.service.wake_request(run_id, payload["until"]):
+                return "操作者手动唤醒，请检查最新状态并处理附带问题"
             getters={"training":(tools.training.get_task,"训练"),"evaluation":(tools.evaluation.get,"评估"),"export":(tools.exports.get,"导出")}
             for ref in payload.get("watch",[]):
                 getter,label=getters[ref["kind"]]
@@ -120,10 +151,17 @@ class AgentController:
         if kind=="human_review":
             return bool(run.review_confirmation)
         if kind=="training_setup":
-            return bool(run.state.get("training_setup"))
+            setup=run.state.get("training_setup") or {}
+            return setup.get("source")=="operator" and setup.get("dataset_export_id")==run.dataset_export_id
         if kind=="agent_review":
             return "review_request" not in run.state
         raise ValueError("未知图中断类型")
+
+    def _queue_busy(self, queue_name: str) -> bool:
+        with redis_connection(self.settings) as connection:
+            return any(queue_name in worker.queue_names() and worker.get_state()=="busy" and worker.last_heartbeat
+                and (datetime.now(timezone.utc)-worker.last_heartbeat).total_seconds()<self.settings.runtime_report_ttl*2
+                for worker in Worker.all(connection=connection))
 
     def advance(self, run_id: str) -> None:
         """推进一个已获得租约的业务运行，直到完成或下一次中断。
@@ -181,6 +219,18 @@ class AgentController:
         with Session(self.engine) as session:
             ids=list(session.scalars(select(AgentRun.id).where(AgentRun.status.in_(["queued","running","waiting","canceling","paused"]),or_(AgentRun.next_poll_at.is_(None),AgentRun.next_poll_at<=now),or_(AgentRun.lease_until.is_(None),AgentRun.lease_until<=now)).order_by(AgentRun.created_at).limit(20)))
         processed=0
+        if time.monotonic() - self.last_gc > 300:
+            from yolo_agent.services.garbage import collect_task_garbage
+            with Session(self.engine) as session:
+                terminal_ids = list(session.scalars(select(DatasetTask.id).where(
+                    DatasetTask.status.in_(["completed", "failed", "stopped", "canceled"])
+                ).order_by(DatasetTask.created_at.desc()).limit(100)))
+            for identity in terminal_ids:
+                try:
+                    collect_task_garbage(self.engine, self.settings, identity)
+                except Exception:
+                    logger.warning("本轮缓存回收未完成，不影响训练控制", exc_info=True)
+            self.last_gc = time.monotonic()
         for run_id in ids:
             with Session(self.engine) as session,session.begin():
                 result=session.execute(update(AgentRun).where(AgentRun.id==run_id,or_(AgentRun.lease_until.is_(None),AgentRun.lease_until<=utc_now())).values(lease_owner=self.owner,lease_until=_time_after(300)))
@@ -188,6 +238,9 @@ class AgentController:
             if not claimed:
                 continue
             processed+=1
+            done=threading.Event()
+            renewal=threading.Thread(target=self._renew_lease,args=(run_id,done),daemon=True)
+            renewal.start()
             try:
                 self.advance(run_id)
             except WorkflowPaused as error:
@@ -201,6 +254,8 @@ class AgentController:
                 self.service.event(run_id,run.phase,"failed",{"error_type":type(error).__name__,"message":str(error)[:4000]},level="error")
                 logger.exception("Agent 节点失败，保留检查点等待人工恢复",extra={"task_id":run_id})
             finally:
+                done.set()
+                renewal.join(timeout=10)
                 with Session(self.engine) as session,session.begin():
                     session.execute(update(AgentRun).where(AgentRun.id==run_id,AgentRun.lease_owner==self.owner).values(lease_owner=None,lease_until=None,next_poll_at=_time_after(self.settings.agent_poll_seconds)))
         return processed

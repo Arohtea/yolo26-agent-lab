@@ -318,6 +318,16 @@ def get_report(task_id: str, service: DatasetService = Depends(dataset_service))
     return FileResponse(path, media_type="application/json", filename=f"dataset-report-{task_id}.json")
 
 
+@router.post("/dataset-tasks/{task_id}/cancel")
+def cancel_dataset_task(task_id: str, service: DatasetService = Depends(dataset_service)):
+    """终止数据处理或标注阶段，并阻止所属 Agent 自动重试。"""
+    from yolo_agent.services.task_control import cancel_task
+    task = service.get_task(task_id)
+    if task.status == "uploading":
+        return service.cancel_upload(task_id)
+    return cancel_task(service.engine, service.settings, "dataset", task_id)
+
+
 @router.get("/datasets/{dataset_id}/tasks", response_model=list[TaskRead])
 def list_tasks(dataset_id: str, limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0), service: DatasetService = Depends(dataset_service)) -> list[DatasetTask]:
     """保留跨阶段可追踪的任务历史，单个活跃任务可查询其详细状态。
@@ -332,7 +342,7 @@ def list_tasks(dataset_id: str, limit: int = Query(50, ge=1, le=200), offset: in
     with Session(service.engine) as session:
         tasks = list(session.scalars(select(DatasetTask).where(DatasetTask.dataset_id == dataset_id).order_by(DatasetTask.created_at.desc(), DatasetTask.id).limit(limit).offset(offset)))
     # 每个数据集至多一个活跃任务，复用已有状态收敛，避免列表永久显示旧排队状态。
-    return [service.get_task(task.id) if task.status in {"queued", "running"} else task for task in tasks]
+    return [service.get_task(task.id) if task.status in {"queued", "running", "canceling"} else task for task in tasks]
 
 
 @router.post("/datasets/{dataset_id}/versions", response_model=TaskRead, status_code=202)

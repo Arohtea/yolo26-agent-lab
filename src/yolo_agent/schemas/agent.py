@@ -136,6 +136,60 @@ class AgentResume(InputModel):
     reviewed_class_schema_id: str | None = None
 
 
+class AgentWake(InputModel):
+    """提前唤醒休眠中的 Agent，问题可留空，不改变预算与审核状态。"""
+
+    question: str = Field(default="", max_length=2000)
+    sleep_until: str | None = Field(default=None, min_length=1, max_length=100)
+
+
+class AgentOperatorMessage(InputModel):
+    """可追溯的唤醒请求和 Agent 回答，由不可变事件推导。"""
+
+    request_id: int
+    sleep_until: str
+    question: str
+    created_at: str
+    answer: str | None = None
+    answered_at: str | None = None
+    instruction_key: str | None = None
+    instruction_active: bool = False
+
+
+class OperatorInstructionChange(InputModel):
+    """指令只能引用当前问题原文；此结构不允许改写冻结预算或训练参数。"""
+
+    instruction_action: Literal["none", "remember", "forget"] = "none"
+    instruction_key: str | None = Field(default=None, max_length=64, pattern=r"^[a-z][a-z0-9_.-]*$")
+    sleep_minutes: float | None = Field(default=None, ge=0.5, le=720)
+
+    @model_validator(mode="after")
+    def validate_instruction(self):
+        if self.instruction_action == "none":
+            if self.instruction_key is not None or self.sleep_minutes is not None:
+                raise ValueError("不保存指令时不能填写指令键或休眠分钟数")
+        elif not self.instruction_key:
+            raise ValueError("保存或取消持续指令必须指定稳定的 instruction_key")
+        if self.instruction_action == "remember" and self.instruction_key == "sleep_interval" and self.sleep_minutes is None:
+            raise ValueError("休眠周期指令必须提供操作者明确要求的 sleep_minutes")
+        if self.sleep_minutes is not None and (self.instruction_key != "sleep_interval" or self.instruction_action != "remember"):
+            raise ValueError("只有保存 sleep_interval 指令时才可填写休眠分钟数")
+        return self
+
+
+class OperatorInstructionRead(InputModel):
+    instruction_id: int
+    key: str
+    request_id: int
+    text: str
+    sleep_minutes: float | None = None
+    created_at: str
+
+
+class OperatorInstructionRevoke(InputModel):
+    instruction_id: int = Field(ge=1)
+
+
 class ClassDraftCreate(InputModel):
     """需求说明只用于生成待人工确认的类别草案，不直接创建类别。"""
 
@@ -143,8 +197,32 @@ class ClassDraftCreate(InputModel):
     requirement: str = Field(min_length=4,max_length=2000)
 
 
+class TrainingPromptOptimize(InputModel):
+    """可选的需求润色，只接收当前表单上下文，不创建训练流程。"""
+
+    project_id: str = Field(min_length=36, max_length=36)
+    requirement: str = Field(min_length=4, max_length=2000)
+    dataset_export_id: str | None = Field(default=None, min_length=36, max_length=36)
+    initial_parameters: TrainingParameters = Field(default_factory=TrainingParameters)
+    policy: AgentPolicy = Field(default_factory=agent_defaults)
+
+    @field_validator("policy", mode="before")
+    @classmethod
+    def inherit_operator_defaults(cls, value):
+        """与训练创建入口使用相同的默认策略合并规则。"""
+        return {**agent_defaults().model_dump(), **value} if isinstance(value, dict) else value
+
+
+class TrainingPromptDraft(InputModel):
+    """返回待用户采用的需求建议，长度与训练创建入口一致。"""
+
+    requirement: str = Field(min_length=4, max_length=2000)
+    notes: str = Field(default="", max_length=1000)
+
+
 class TrainingSetup(InputModel):
     """人工审核完成后由操作者开始训练：首轮参数可选，预算只能在创建时的上限内收紧。"""
 
     initial_parameters: dict = Field(default_factory=dict)
     policy: dict = Field(default_factory=dict)
+    dataset_export_id: str | None = None

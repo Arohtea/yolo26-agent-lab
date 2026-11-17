@@ -12,6 +12,7 @@ from yolo_agent.models.dataset import Dataset, DatasetImage, DatasetTask, Datase
 from yolo_agent.schemas.dataset import ImageRead
 from yolo_agent.services.annotations import annotation_digest
 from yolo_agent.services.datasets import DatasetService, owned_path
+from yolo_agent.services.task_control import require_running
 from yolo_agent.services.inspector import analyze_images
 from yolo_agent.workers.dataset_tasks import _snapshots, _write_json
 
@@ -21,8 +22,11 @@ def copy_dataset(engine, settings, task_id, dataset_id, parameters):
     try:
         return _copy_dataset(engine, settings, task_id, dataset_id, parameters)
     except Exception:
-        for directory in (f"images/{task_id}", f"previews/copies/{task_id}", f"versions/{task_id}"):
-            shutil.rmtree(owned_path(settings, directory), ignore_errors=True)
+        with Session(engine) as session:
+            published = session.scalar(select(DatasetImage.id).where(DatasetImage.import_task_id == task_id).limit(1))
+        if not published:
+            for directory in (f"images/{task_id}", f"previews/copies/{task_id}", f"versions/{task_id}"):
+                shutil.rmtree(owned_path(settings, directory), ignore_errors=True)
         raise
 
 
@@ -48,6 +52,9 @@ def _copy_dataset(engine, settings, task_id, dataset_id, parameters):
         run = session.get(AnnotationRun, parameters["run_id"]) if parameters.get("run_id") else None
         if run and (run.version_id != source_version_id or run.status not in {"pending_review", "reviewed", "exported"}):
             raise ValueError("来源标注仍在变化，请完成来源处理后重新复制")
+        if run:
+            from yolo_agent.services.annotations import assert_reviewed
+            assert_reviewed(session, run)
         schema = session.get(ClassSchema, run.class_schema_id) if run else None
         originals = list(session.scalars(select(Annotation).where(Annotation.run_id == run.id))) if run else []
         original_reviews = {review.image_id: review for review in session.scalars(select(ImageReview).where(ImageReview.run_id == run.id))} if run else {}
@@ -85,7 +92,11 @@ def _copy_dataset(engine, settings, task_id, dataset_id, parameters):
             members.append({**ImageRead.model_validate(image).model_dump(), "storage_path": relative,
                 "split": source["split"], "group_id": source["group_id"]})
         with Session(engine) as session, session.begin():
-            session.get(DatasetTask, task_id).processed = index
+            task = session.get(DatasetTask, task_id)
+            require_running(task)
+            task.processed = index
+            task.result = {"progress": {"stage": "copying_images", "completed_images": index,
+                "total_images": len(snapshots), "estimated": False}}
     copied_run_id, schema_id, version_id = (new_id(), new_id(), task_id) if run else (None, None, task_id if version else None)
     boxes, reviews, events = [], [], []
     source_boxes, copied_boxes = defaultdict(list), defaultdict(list)
@@ -130,6 +141,7 @@ def _copy_dataset(engine, settings, task_id, dataset_id, parameters):
     report = f"reports/dataset-copy-{task_id}.json"
     _write_json(owned_path(settings, report), {**result, "source_image_ids": id_map})
     with Session(engine) as session, session.begin():
+        require_running(session.get(DatasetTask, task_id))
         target = session.get(Dataset, dataset_id)
         if target is None or target.deleted_at:
             raise ValueError("目标数据集已删除，拒绝发布副本")
@@ -152,5 +164,24 @@ def _copy_dataset(engine, settings, task_id, dataset_id, parameters):
             session.flush()
             session.add_all(boxes + reviews + events)
         task = session.get(DatasetTask, task_id)
-        task.status, task.result, task.report_path, task.finished_at = "completed", result, report, utc_now()
+        task.result, task.report_path = result, report
+    if ready:
+        from yolo_agent.workers.annotation_tasks import _export_dataset
+        def progress(stage, completed_images=0, **details):
+            with Session(engine) as session, session.begin():
+                task = session.get(DatasetTask, task_id)
+                require_running(task)
+                task.result = {**result, "progress": {"stage": stage, "completed_images": completed_images,
+                    "total_images": len(members), "estimated": False, **details}}
+        _, export_record = _export_dataset(engine, settings, copied_run_id, members, schema.classes, progress=progress)
+        with Session(engine) as session, session.begin():
+            require_running(session.get(DatasetTask, task_id))
+            session.add(export_record)
+            session.get(AnnotationRun, copied_run_id).status = "exported"
+            result["dataset_export_id"] = export_record.id
+    with Session(engine) as session, session.begin():
+        task = session.get(DatasetTask, task_id)
+        require_running(task)
+        task.status, task.result, task.finished_at = "completed", result, utc_now()
+    _write_json(owned_path(settings, report), {**result, "source_image_ids": id_map})
     return result

@@ -13,11 +13,17 @@ from yolo_agent.models.database import create_database_engine
 from yolo_agent.models.dataset import DatasetImage, DatasetTask, DatasetVersion, VersionImage, new_id, utc_now
 from yolo_agent.schemas.dataset import ImageRead
 from yolo_agent.services.datasets import fail_dataset_task, owned_path
+from yolo_agent.services.task_control import require_running
 from yolo_agent.services.inspector import analyze_images, inspect_image, split_images, encoded_image_suffix
 from yolo_agent.settings import get_settings
 from yolo_agent.utils.logging import configure_logging
 
 logger = logging.getLogger(__name__)
+
+
+def on_dataset_stopped(job, connection) -> None:
+    """RQ 人工停止使用独立回调，与故障处理共用状态收敛及缓存回收。"""
+    on_dataset_failure(job, connection, RuntimeError, "操作者终止任务", None)
 
 
 def _write_json(path: Path, content: dict) -> str:
@@ -57,6 +63,8 @@ def on_dataset_failure(job, connection, exc_type, exc_value, traceback) -> None:
     engine = create_database_engine(get_settings())
     try:
         fail_dataset_task(engine, job.id, f"{getattr(exc_type, '__name__', str(exc_type))}: {exc_value}")
+        from yolo_agent.services.garbage import collect_task_garbage
+        collect_task_garbage(engine, get_settings(), job.id)
     finally:
         engine.dispose()
 
@@ -122,6 +130,10 @@ def run_dataset_task(task_id: str) -> dict:
             report["format_adaptations"] = adaptations
             result = {"image_count": len(ids), "valid_images": report["valid_images"], "status_counts": report["status_counts"], "corrected_extensions": len(adaptations)}
         elif kind in {"analysis", "version"}:
+            with Session(engine) as session, session.begin():
+                current = session.get(DatasetTask, task_id)
+                require_running(current)
+                current.result = {"progress": {"stage": "analyzing_dataset", "total_images": current.total}}
             with Session(engine) as session:
                 images = _snapshots(session, parameters["image_ids"])
             policy = parameters["policy"]
@@ -130,10 +142,15 @@ def run_dataset_task(task_id: str) -> dict:
             if kind == "version":
                 snapshots, summary = split_images(images, graph, policy)
                 # 封存前校验实际原图，阻止外部文件变动悄悄改变数据集版本。
-                for image in snapshots:
+                for index, image in enumerate(snapshots, start=1):
                     with owned_path(settings, image["storage_path"]).open("rb") as stream:
                         if hashlib.file_digest(stream, "sha256").hexdigest() != image["sha256"]:
                             raise ValueError(f"原图已发生变化，拒绝封存：{image['id']}")
+                    with Session(engine) as session, session.begin():
+                        current = session.get(DatasetTask, task_id)
+                        require_running(current)
+                        current.processed, current.total = index, len(snapshots)
+                        current.result = {"progress": {"stage": "validating_version", "completed_images": index, "total_images": len(snapshots)}}
                 version_id = new_id()
                 with Session(engine) as session:
                     number = (session.scalar(select(func.max(DatasetVersion.number)).where(DatasetVersion.dataset_id == dataset_id)) or 0) + 1
@@ -146,6 +163,11 @@ def run_dataset_task(task_id: str) -> dict:
                     "annotation_status": "unlabeled", "ready_for_training": False,
                 }
                 manifest_path = owned_path(settings, manifest_relative)
+                with Session(engine) as session, session.begin():
+                    task = session.get(DatasetTask, task_id)
+                    require_running(task)
+                    task.result = {"progress": {"stage": "writing_version", "version_id": version_id,
+                        "completed_images": len(snapshots), "total_images": len(snapshots)}}
                 digest = _write_json(manifest_path, manifest)
                 manifest_path.chmod(0o444)
                 version_record = DatasetVersion(
@@ -162,6 +184,7 @@ def run_dataset_task(task_id: str) -> dict:
         report_relative = f"reports/{task_id}.json"
         _write_json(owned_path(settings, report_relative), report)
         with Session(engine) as session, session.begin():
+            require_running(session.get(DatasetTask, task_id))
             if version_record is not None:
                 session.add(version_record)
                 session.flush()

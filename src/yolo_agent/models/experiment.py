@@ -88,12 +88,13 @@ class ModelExport(Base):
     """部署格式由独立任务转换，原始权重保持只读，同一权重同一格式只保留一份活跃转换。"""
 
     __tablename__ = "model_exports"
-    __table_args__ = (Index("uq_active_model_export", "model_id", "format", unique=True, sqlite_where=text("status IN ('queued','running')")),)
+    __table_args__ = (Index("uq_active_model_export", "model_id", "format", unique=True, sqlite_where=text("status IN ('queued','running','canceling')")),)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     model_id: Mapped[str] = mapped_column(ForeignKey("model_registry.id"), index=True)
     format: Mapped[str]
     status: Mapped[str] = mapped_column(default="queued")
     requested_by: Mapped[str] = mapped_column(default="operator")
+    stop_requested: Mapped[bool] = mapped_column(default=False)
     reason: Mapped[str] = mapped_column(default="")
     path: Mapped[str | None]
     sha256: Mapped[str | None]

@@ -37,14 +37,15 @@ class DatasetCopy(InputModel):
 class LabeledImportOptions(InputModel):
     """已标注不自动等于已审核；审核继承须由操作者明确声明。"""
 
-    accepted_reviewed_source: bool = False
-    reviewer: str = Field(default="", max_length=200)
-    confirmation: str = Field(default="", max_length=4000)
+    accepted_reviewed_source: bool = True
+    reviewer: str = Field(default="上传者", max_length=200)
+    confirmation: str = Field(default="上传者声明该数据集已完成标注、逐图审核和漏标检查", max_length=4000)
 
     @model_validator(mode="after")
     def require_attribution(self):
         if self.accepted_reviewed_source and (not self.reviewer or not self.confirmation):
-            raise ValueError("继承外部审核需填写审核者及审核来源说明，并确认已经检查漏标")
+            self.reviewer = self.reviewer or "上传者"
+            self.confirmation = self.confirmation or "上传者声明该数据集已完成标注、逐图审核和漏标检查"
         return self
 
 

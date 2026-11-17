@@ -5,3 +5,9 @@ services:
       args:
         TORCH_FLAVOR: ${YOLO_TORCH_FLAVOR:-cu128}
     gpus: all
+  annotation-worker:
+    image: yolo26-agent-lab-worker:${YOLO_TORCH_FLAVOR:-cu128}-0.1.0
+    build:
+      args:
+        TORCH_FLAVOR: ${YOLO_TORCH_FLAVOR:-cu128}
+    gpus: all

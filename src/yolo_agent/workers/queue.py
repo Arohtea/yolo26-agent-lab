@@ -23,14 +23,14 @@ def redis_connection(settings: Settings, *, blocking: bool = False) -> Redis:
     )
 
 
-def get_queue(settings: Settings) -> Queue:
+def get_queue(settings: Settings, *, queue_name: str | None = None) -> Queue:
     """让生产者和消费者采用同一 JSON 编码规则。
 
     :param settings: 队列及执行超时配置。
     :returns: 项目计算任务队列。
     """
     return Queue(
-        settings.queue_name, connection=redis_connection(settings),
+        queue_name or settings.queue_name, connection=redis_connection(settings),
         serializer=JSONSerializer, default_timeout=settings.job_timeout,
     )
 
@@ -55,27 +55,29 @@ def enqueue_dataset_task(settings: Settings, task_id: str) -> Job:
     :param task_id: Worker 从数据库读取的任务 ID，不接受函数名或文件路径。
     :returns: 已提交的 RQ 任务。
     """
-    return get_queue(settings).enqueue(
+    return get_queue(settings, queue_name=settings.data_queue_name).enqueue(
         "yolo_agent.workers.dataset_tasks.run_dataset_task", task_id,
         job_id=task_id, job_timeout=settings.dataset_job_timeout,
         result_ttl=settings.job_result_ttl, failure_ttl=settings.job_result_ttl,
         on_failure=Callback("yolo_agent.workers.dataset_tasks.on_dataset_failure"),
+        on_stopped=Callback("yolo_agent.workers.dataset_tasks.on_dataset_stopped"),
         description=f"数据集处理 {task_id}",
     )
 
 
-def enqueue_annotation_task(settings: Settings, task_id: str) -> Job:
+def enqueue_annotation_task(settings: Settings, task_id: str, *, cpu_only: bool = False) -> Job:
     """提交固定标注执行器，禁用调用者选择函数或下载地址。
 
     :param settings: 执行时限及队列配置。
     :param task_id: 已登记的业务任务 ID。
     :returns: RQ 任务。
     """
-    return get_queue(settings).enqueue(
+    return get_queue(settings, queue_name=settings.data_queue_name if cpu_only else settings.annotation_queue_name).enqueue(
         "yolo_agent.workers.annotation_tasks.run_annotation_task", task_id,
         job_id=task_id, job_timeout=settings.annotation_job_timeout,
         result_ttl=settings.job_result_ttl, failure_ttl=settings.job_result_ttl,
         on_failure=Callback("yolo_agent.workers.annotation_tasks.on_annotation_failure"),
+        on_stopped=Callback("yolo_agent.workers.dataset_tasks.on_dataset_stopped"),
         description=f"标注处理 {task_id}",
     )
 
@@ -110,6 +112,7 @@ def enqueue_evaluation_task(settings: Settings, task_id: str, *, timeout_seconds
         job_id=task_id, job_timeout=min(settings.evaluation_job_timeout,timeout_seconds or settings.evaluation_job_timeout),
         result_ttl=settings.job_result_ttl, failure_ttl=settings.job_result_ttl,
         on_failure=Callback("yolo_agent.workers.evaluation_tasks.on_evaluation_failure"),
+        on_stopped=Callback("yolo_agent.workers.evaluation_tasks.on_evaluation_stopped"),
         description=f"验证集评估 {task_id}",
     )
 
@@ -121,10 +124,11 @@ def enqueue_export_task(settings: Settings, export_id: str) -> Job:
     :param export_id: 已登记的导出任务。
     :returns: RQ 任务。
     """
-    return get_queue(settings).enqueue(
+    return get_queue(settings, queue_name=settings.data_queue_name).enqueue(
         "yolo_agent.workers.export_tasks.run_export_task", export_id,
         job_id=export_id, job_timeout=settings.export_job_timeout,
         result_ttl=settings.job_result_ttl, failure_ttl=settings.job_result_ttl,
         on_failure=Callback("yolo_agent.workers.export_tasks.on_export_failure"),
+        on_stopped=Callback("yolo_agent.workers.export_tasks.on_export_stopped"),
         description=f"模型格式导出 {export_id}",
     )

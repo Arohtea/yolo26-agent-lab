@@ -19,6 +19,7 @@ from yolo_agent.models.dataset import DatasetTask, DatasetVersion, VersionImage,
 from yolo_agent.schemas.annotation import AnnotationRead
 from yolo_agent.services.annotations import annotation_digest, assert_reviewed
 from yolo_agent.services.datasets import DatasetError, fail_dataset_task, owned_path
+from yolo_agent.services.task_control import require_running
 from yolo_agent.settings import get_settings
 from yolo_agent.utils.logging import configure_logging
 
@@ -38,6 +39,8 @@ def on_annotation_failure(job, connection, exc_type, exc_value, traceback) -> No
     engine = create_database_engine(get_settings())
     try:
         fail_dataset_task(engine, job.id, f"{getattr(exc_type, '__name__', str(exc_type))}: {exc_value}")
+        from yolo_agent.services.garbage import collect_task_garbage
+        collect_task_garbage(engine, get_settings(), job.id)
     finally:
         engine.dispose()
 
@@ -54,6 +57,15 @@ def _prepare_frames(settings, run_id: str, members: list[dict], progress=None) -
     paths = []
     for member in members:
         source = _verify_image(settings, member)
+        if member.get("exif_orientation", 1) in {None, 1}:
+            # CVAT 直接接收正向 JPEG/MPO、PNG 和 WEBP；仅重命名独立副本以关联图片编号。
+            target = owned_path(settings, f"annotations/{run_id}/frames/{member['id']}{source.suffix.lower()}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            paths.append(target)
+            if progress:
+                progress("preparing_images", len(paths))
+            continue
         target = owned_path(settings, f"annotations/{run_id}/frames/{member['id']}.png")
         target.parent.mkdir(parents=True, exist_ok=True)
         with Image.open(source) as image:
@@ -112,17 +124,22 @@ def run_annotation_task(task_id: str) -> dict:
         def report_progress(stage, completed_images=0, **details):
             with Session(engine) as session, session.begin():
                 current = session.get(DatasetTask, task_id)
+                require_running(current)
                 current.processed = completed_images
                 current.result = {"progress": {"stage": stage, "completed_images": completed_images,
                                   "total_images": len(members), "estimated": False, **details}}
 
         export_record = None
         if kind == "auto_annotate":
+            # 使用标注专用设备，不继承训练 Worker 的 CUDA 选择。
+            settings = settings.model_copy(update={"device": settings.annotation_device})
             import torch
+            torch.set_num_threads(settings.annotation_cpu_threads)
             from yolo_agent.services.runtime import collect_runtime, require_device
             device=require_device(collect_runtime(settings.device))
             if device.startswith("cuda"):
-                torch.cuda.set_per_process_memory_fraction(min(settings.max_gpu_memory_ratio,parameters.get("execution_limits",{}).get("gpu_memory_ratio",0.9)),device=device)
+                torch.cuda.set_per_process_memory_fraction(min(settings.max_gpu_memory_ratio, settings.annotation_gpu_memory_ratio, parameters.get("execution_limits",{}).get("gpu_memory_ratio",0.9)),device=device)
+            report_progress("loading_annotation_models", 0, device=device, worker_queue=job.origin)
             from yolo_agent.services.annotators import AnnotationDispatcher, cvat_eligible, validate_source_plan
 
             with Session(engine) as session:
@@ -138,7 +155,10 @@ def run_annotation_task(task_id: str) -> dict:
                         session.add(Annotation(run_id=run_id, image_id=member["id"], **prediction))
                     current.processed = index
                     session.get(DatasetTask, task_id).processed = index
+                    session.get(DatasetTask, task_id).result = {"progress": {"stage": "annotating_images", "completed_images": index,
+                        "total_images": len(members), "device": device, "worker_queue": job.origin, "estimated": False}}
             with Session(engine) as session, session.begin():
+                require_running(session.get(DatasetTask, task_id))
                 session.get(AnnotationRun, run_id).status = "pending_review"
                 boxes = list(session.scalars(select(Annotation).where(Annotation.run_id == run_id)))
                 result = {"run_id":run_id,"status":"pending_review","image_count":len(members),"box_count":len(boxes),"proposed_class_distribution":dict(Counter(box.class_name for box in boxes)),"source_counts":dict(Counter(box.annotation_source for box in boxes)),"cvat_eligible_boxes":sum(cvat_eligible(AnnotationRead.model_validate(box).model_dump()) for box in boxes),"flag_counts":dict(Counter(flag for box in boxes for flag in box.flags)),"routing":[{"split":split,"source":source,"class_id":class_id,"images":count} for (split,source,class_id),count in sorted(detector.routing_counts.items())],"device":device,"is_ground_truth":False}
@@ -149,9 +169,14 @@ def run_annotation_task(task_id: str) -> dict:
             frames = _prepare_frames(settings, run_id, members, progress=report_progress)
             with Session(engine) as session:
                 boxes = [AnnotationRead.model_validate(box).model_dump() for box in session.scalars(select(Annotation).where(Annotation.run_id == run_id))]
+            def remember_remote(remote_id):
+                with Session(engine) as session, session.begin():
+                    # 即使收到停止请求，也记录刚刚创建的远程任务，供查看和清理。
+                    session.get(AnnotationRun, run_id).cvat_task_id = remote_id
             remote_id, digest = upload_cvat(settings, run_id, classes, frames, boxes,
-                                            progress=lambda stage: report_progress(stage, len(frames)))
+                                            progress=lambda stage: report_progress(stage, len(frames)), on_created=remember_remote)
             with Session(engine) as session, session.begin():
+                require_running(session.get(DatasetTask, task_id))
                 current = session.get(AnnotationRun, run_id)
                 current.cvat_task_id, current.cvat_fingerprint = remote_id, digest
             result = {"run_id":run_id,"cvat_task_id":remote_id,"review_url":f"{(settings.cvat_public_url or settings.cvat_url).rstrip('/')}/tasks/{remote_id}","status":"pending_review"}
@@ -179,6 +204,7 @@ def run_annotation_task(task_id: str) -> dict:
                 platform_id = next((attribute["value"] for attribute in shape.get("attributes", []) if attribute["spec_id"] == attribute_id), None)
                 grouped[image_id].append((label_map[name], box, platform_id))
             with Session(engine) as session, session.begin():
+                require_running(session.get(DatasetTask, task_id))
                 current = session.get(AnnotationRun, run_id)
                 current.class_schema_id = reviewed_schema_id
                 if session.scalar(select(DatasetExport.id).where(DatasetExport.run_id == run_id)):
@@ -228,9 +254,12 @@ def run_annotation_task(task_id: str) -> dict:
                 session.add(export_record)
                 current.status = "exported"
             task = session.get(DatasetTask, task_id)
+            require_running(task)
             task.status, task.result, task.report_path = "completed", result, relative
             task.finished_at, task.processed = utc_now(), len(members)
         logger.info("标注任务完成", extra={"task_id":task_id,"result":result})
+        from yolo_agent.services.garbage import collect_task_garbage
+        collect_task_garbage(engine, settings, task_id)
         return result
     except Exception as error:
         on_annotation_failure(job, None, type(error), error, None)
@@ -290,10 +319,7 @@ def _export_dataset(engine, settings, run_id: str, members: list[dict], classes:
     manifest_path = target / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2)+"\n")
     manifest_hash = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-    report("export_archiving", len(members), export_id=export_id)
-    archive = Path(shutil.make_archive(str(target), "zip", root_dir=target))
-    report("export_verifying_archive", len(members), export_id=export_id)
-    with archive.open("rb") as stream:
-        archive_hash = hashlib.file_digest(stream, "sha256").hexdigest()
-    record = DatasetExport(id=export_id, version_id=version_id, run_id=run_id, directory=relative, manifest_sha256=manifest_hash, archive_path=f"{relative}.zip", archive_sha256=archive_hash, summary=summary)
-    return {"run_id":run_id,"export_id":export_id,"summary":summary,"archive_sha256":archive_hash}, record
+    # 训练只需要目录和冻结清单；ZIP 复用已有数据集导出任务，在用户下载时单独生成。
+    report("export_ready", len(members), export_id=export_id)
+    record = DatasetExport(id=export_id, version_id=version_id, run_id=run_id, directory=relative, manifest_sha256=manifest_hash, archive_path="", archive_sha256="", summary=summary)
+    return {"run_id":run_id,"export_id":export_id,"summary":summary,"archive_sha256":"","archive_on_demand":True}, record

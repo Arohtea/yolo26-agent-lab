@@ -7,31 +7,39 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated, TypedDict
 
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import RetryPolicy, interrupt
-from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
+from langgraph.types import Overwrite, RetryPolicy, interrupt
+from langchain_core.messages import convert_to_openai_messages
+from openai import APIConnectionError, APITimeoutError, BadRequestError, InternalServerError, RateLimitError
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from yolo_agent.agents.context import assemble, build_dossier
+from yolo_agent.agents.context import MAX_IMAGES, assemble, build_dossier
+from yolo_agent.agents.context_memory import ContextMemory, context_signature
 from yolo_agent.agents.optimization import stagnation_recommendations
-from yolo_agent.agents.planner import SYSTEM_PROMPT, call_model
+from yolo_agent.agents.planner import SYSTEM_PROMPT, call_model, summarize_context
 from yolo_agent.agents.reporting import finalize_run
 from yolo_agent.models.annotation import AnnotationRun, DatasetExport
 from yolo_agent.models.dataset import utc_now
 from yolo_agent.schemas.agent import AgentPolicy
 from yolo_agent.services.agents import AgentService
+from yolo_agent.services.agent_skills import SKILL_RESULT_CHARS, SKILL_TOOLS
 from yolo_agent.services.datasets import DatasetError, owned_path
+from yolo_agent.services.context_budget import ContextBudgetError, budget_for_run, context_profile, context_length_rejected, images_rejected
 from yolo_agent.services.training import validate_export
 from yolo_agent.tools.workflow import CONTROL_TOOLS, WorkflowPaused, WorkflowStopped, WorkflowTools
 
-TOOL_RESULT_CHARS = 12_000
+TOOL_RESULT_CHARS = 6_000
 
 
 class WorkflowState(TypedDict, total=False):
     """检查点只保存 JSON 业务身份、对话与小型状态，不保存 ORM、模型对象或图像。"""
 
     run_id: str
+    context_memory: dict
+    context_ready: str
+    context_compacting: bool
+    context_image_limit: int
     analysis_task: str
     annotation_task: str
     annotation_attempt: int
@@ -210,7 +218,11 @@ class WorkflowNodes:
     def _training_setup(self, state: WorkflowState):
         run=self._enter("training_setup",state)
         # 从原图启动的运行在人审后停下，由操作者确认首轮参数与预算后才开始训练。
-        if not run.state.get("training_setup"):
+        setup=run.state.get("training_setup") or {}
+        preparation=run.state.get("workflow_mode")=="preparation" or bool(run.state.get("annotation_run_id"))
+        authorized=bool(setup) and (not preparation or (
+            setup.get("source")=="operator" and setup.get("dataset_export_id")==run.dataset_export_id))
+        if not authorized:
             payload={"kind":"training_setup","dataset_export_id":run.dataset_export_id}
             self.service.patch(self.run_id,status="needs_review",state={"waiting":payload})
             interrupt(payload)
@@ -232,19 +244,100 @@ class WorkflowNodes:
             return "训练用时预算耗尽"
         return None
 
+    def _record_response(self, metadata, stats, *, turn, kind):
+        self.service.event(self.run_id, "agent", "model_response_received", {"turn": turn, "kind": kind, "metadata": metadata, "context": stats})
+        usage = metadata.get("usage") or {}
+        actual = usage.get("prompt_tokens") or usage.get("input_tokens")
+        current = self.service.get(self.run_id)
+        budget = budget_for_run(self.service.settings, current.state)
+        estimated = stats.get("estimated_input_tokens", 0)
+        scale = budget.scale * actual / estimated * 1.03 if actual and estimated and actual > estimated else budget.scale
+        self.service.patch(self.run_id, state={"context_profile": context_profile(self.service.settings), "token_estimation_scale": scale,
+            "context_usage": {**stats, "actual_input_tokens": actual, "kind": kind}})
+
+    def _context_overflow(self):
+        run = self.service.get(self.run_id)
+        budget = budget_for_run(self.service.settings, run.state)
+        if budget.window_factor <= 0.1:
+            raise ContextBudgetError("模型服务在最小有效窗口下仍拒绝上下文长度，请核对该模型的实际窗口配置；已保留历史、持续指令和图片能力。")
+        self.service.patch(self.run_id, state={"context_profile": context_profile(self.service.settings), "context_window_factor": max(0.1, budget.window_factor * 0.7)})
+        self.service.event(self.run_id, "agent", "context_window_rejected", {"action": "缩小有效窗口并重新摘要，保留图片能力和操作者指令"}, level="warning")
+
+    def _prepare_context(self, state: WorkflowState):
+        run = self._enter("agent", state)
+        self.tools.guard("optimize")
+        settings = self.service.settings
+        manager = ContextMemory(settings, run.state)
+
+        def summary_model(messages):
+            request = convert_to_openai_messages(messages)
+            estimate = manager.budget.check(request)
+            turn = self.service.reserve_model_call(self.run_id, kind="summary", reserve_decision=True)
+            try:
+                return summarize_context(settings, messages, on_response=lambda metadata: self._record_response(metadata,
+                    {**manager.budget.info(), "estimated_input_tokens": estimate, "images": 0}, turn=turn, kind="summary"))
+            except BadRequestError as error:
+                if context_length_rejected(error):
+                    self._context_overflow()
+                    raise ValueError("摘要请求超过模型服务的实际窗口，保留原始历史并缩小预算后重试") from None
+                raise
+
+        try:
+            history, memory, stats = manager.compact_once(state.get("messages", []), build_dossier(self.tools, model_calls=run.state.get("model_calls", 0)),
+                self.tools.specs(), SYSTEM_PROMPT, state.get("context_memory"), summary_model,
+                may_summarize=run.state.get("model_calls", 0) + 2 <= self.policy.max_model_calls,
+                force=state.get("context_compacting", False), include_images=not run.state.get("image_inputs_rejected", False))
+        except ContextBudgetError as error:
+            return {"route": "finish", "stop_reason": str(error)}
+        fresh = self.service.get(self.run_id)
+        more = stats["needs_more"] and fresh.state.get("model_calls", 0) + 2 <= self.policy.max_model_calls
+        if stats["estimated_input_tokens"] > manager.budget.input_limit and not more:
+            return {"route": "finish", "stop_reason": "上下文仍超出安全窗口，模型调用预算不足以继续摘要；原始对话与持续指令已保留。"}
+        self.service.patch(self.run_id, state={"context_usage": stats})
+        if stats["compacted"]:
+            self.service.event(self.run_id, "agent", "context_compacted", {key: stats[key] for key in ("estimated_input_tokens", "history_units", "kept_units", "compactions", "summarized_units")})
+        return {"messages": Overwrite(history), "context_memory": memory, "context_image_limit": stats["image_limit"],
+            "context_compacting": more, "context_ready": context_signature(history, settings, fresh.state), "route": "context" if more else "agent"}
+
     def _agent(self, state: WorkflowState):
         run=self._enter("agent",state)
         self.tools.guard("optimize")
         self.tools.sync_iterations()
         history=state.get("messages",[])
-        turn=sum(message["role"]=="assistant" for message in history)
+        # 调用预算独立于被裁剪的历史，超时与格式错误的尝试也计入持久预算。
+        turn=max(int(run.state.get("model_calls", 0)), sum(message["role"]=="assistant" for message in history))
         progress,budget=self.tools.stagnation(),self.service.budget(self.run_id)
         self.service.patch(self.run_id,state={"stagnation":progress,"budget":budget,"model_calls":turn,"iteration":budget["experiments"]})
         reason=self._stop_reason(run,progress,budget,turn)
         if reason:
             return {"route":"finish","stop_reason":reason}
-        messages,stats=assemble(self.service.settings,SYSTEM_PROMPT,history,build_dossier(self.tools,model_calls=turn))
-        message,metadata=call_model(self.service.settings,messages,self.tools.specs(),on_response=lambda metadata:self.service.event(self.run_id,"agent","model_response_received",{"turn":turn,"metadata":metadata,"context":stats}))
+        if run.state.get("tool_error_streak", 0) >= 3:
+            return {"route":"finish","stop_reason":"连续三轮工具调用未成功，已停止自动尝试并保留结果，请检查工具错误记录"}
+        if state.get("context_ready") != context_signature(history, self.service.settings, run.state):
+            return {"route": "context"}
+        specs = self.tools.specs()
+        try:
+            messages,stats=assemble(self.service.settings,SYSTEM_PROMPT,history,build_dossier(self.tools,model_calls=turn), include_images=not run.state.get("image_inputs_rejected",False),
+                summary=(state.get("context_memory") or {}).get("summary", ""), tools=specs,
+                budget=budget_for_run(self.service.settings, run.state), image_limit=state.get("context_image_limit", MAX_IMAGES))
+        except ContextBudgetError:
+            return {"route": "context", "context_compacting": True}
+        stats["compactions"] = (state.get("context_memory") or {}).get("compactions", 0)
+        turn = self.service.reserve_model_call(self.run_id, kind="decision")
+        try:
+            message,metadata=call_model(self.service.settings,messages,specs,on_response=lambda metadata:self._record_response(metadata, stats, turn=turn, kind="decision"))
+        except BadRequestError as error:
+            if context_length_rejected(error):
+                try:
+                    self._context_overflow()
+                except ContextBudgetError as error:
+                    return {"route": "finish", "stop_reason": str(error)}
+                raise ValueError("模型服务拒绝本次上下文长度，将缩小窗口并重新摘要；图片能力保留") from None
+            if stats["images"] and images_rejected(error):
+                self.service.patch(self.run_id,state={"image_inputs_rejected":True})
+                self.service.event(self.run_id,"agent","image_request_rejected",{"action":"移除图像输入，继续使用结构化指标和混淆矩阵证据"},level="warning")
+                raise ValueError("模型拒绝带图请求，下一次有限重试将使用结构化训练档案") from None
+            raise
         # 调用 ID 统一按轮次与位置改写：重放时据此推导业务身份，也避免兼容服务返回重复 ID。
         for index,call in enumerate(message["tool_calls"]):
             call["id"]=f"t{turn}c{index}"
@@ -254,8 +347,8 @@ class WorkflowNodes:
     def _act(self, state: WorkflowState):
         self._enter("agent_tools",state)
         message=state["messages"][-1]
-        turn=sum(item["role"]=="assistant" for item in state["messages"])-1
-        results,update=[],{"route":"agent"}
+        turn=max(0,int(self.service.get(self.run_id).state.get("model_calls", 1))-1)
+        results,outcomes,update=[],[],{"route":"agent"}
         for call in message["tool_calls"]:
             name,raw=call["function"]["name"],call["function"]["arguments"]
             arguments=raw
@@ -263,6 +356,8 @@ class WorkflowNodes:
                 arguments=json.loads(raw or "{}")
                 if name in CONTROL_TOOLS:
                     args=self.tools.control_args(name,arguments)
+                    if self.service.operator_messages(self.run_id, pending_only=True):
+                        raise ValueError("有未回答的操作者问题，请先读取所需证据并调用 answer_operator 回答，再休眠、请求人工处理或结束")
                     if update["route"]!="agent":
                         raise ValueError("一次回复只能包含一个 sleep、request_human_review 或 finish")
                     if name=="sleep":
@@ -273,6 +368,7 @@ class WorkflowNodes:
                     else:
                         update.update(route="finish",finish=args,stop_reason=args["reason"])
                     self.service.event(self.run_id,"agent","tool_call",{"turn":turn,"tool":name,"arguments":arguments,"ok":True,"result":"已接受"})
+                    outcomes.append(True)
                     continue
                 output,ok=self.tools.dispatch(name,arguments,key=call["id"]),True
             except (WorkflowPaused,WorkflowStopped):
@@ -281,12 +377,20 @@ class WorkflowNodes:
                 # 参数或业务约束错误回给模型修正，不让整个运行失败。
                 output,ok={"error":str(error)[:2000]},False
             images=output.pop("_images",[])
+            outcomes.append(ok)
             content=json.dumps(output,ensure_ascii=False,default=str)
-            if len(content)>TOOL_RESULT_CHARS:
-                content=content[:TOOL_RESULT_CHARS]+"…（结果过长已截断，可用 get_experiment 等工具分项读取）"
+            result_limit = SKILL_RESULT_CHARS if name in SKILL_TOOLS else TOOL_RESULT_CHARS
+            if len(content)>result_limit:
+                content=json.dumps({"result_too_large": True, "tool": name, "characters": len(content),
+                    "message": "结果超过单次阅读上限，未返回不完整 JSON。请减小 limit、分批 names/parameter_names，或指定 section、class_names、metric_names 后重新读取。",
+                    "available_fields": list(output)}, ensure_ascii=False)
+                images=[]
             results.append({"role":"tool","tool_call_id":call["id"],"content":content,**({"_images":images} if images else {})})
             self.service.event(self.run_id,"agent","tool_call",{"turn":turn,"tool":name,"arguments":arguments,"ok":ok,"result":content[:2000]})
-        return {"messages":results,**update}
+        failures = bool(outcomes) and not any(outcomes)
+        run = self.service.get(self.run_id)
+        self.service.patch(self.run_id,state={"tool_error_streak":run.state.get("tool_error_streak",0)+1 if failures else 0})
+        return {"messages": results, **update}
 
     def _sleep(self, state: WorkflowState):
         self._enter("agent_sleep",state)
@@ -295,6 +399,11 @@ class WorkflowNodes:
         self.service.patch(self.run_id,status="waiting",state={"waiting":payload})
         woke=interrupt(payload) or {}
         result={"woke_at":utc_now(),"reason":woke.get("reason") or "到达设定的唤醒时间"}
+        request = self.service.wake_request(self.run_id, sleep["until"])
+        if request:
+            result["operator_request"] = request
+            result["reason"] = "操作者手动唤醒"
+        self.service.patch(self.run_id, state={"waiting": {}})
         self.service.event(self.run_id,"agent","woke",result)
         return {"messages":[{"role":"tool","tool_call_id":sleep["call_id"],"content":json.dumps(result,ensure_ascii=False)}],"sleep":None}
 
@@ -321,6 +430,12 @@ class WorkflowNodes:
             except DatasetError:
                 pass
         self.service.patch(self.run_id,state={"agent_finish":state.get("finish")})
+        pending=self.tools.active_task_refs()
+        if pending:
+            # finish 可能与 export_model 同轮提交，必须等文件校验或停止真正结束后再封存报告。
+            payload={"kind":"finish_tasks","watch":pending}
+            self.service.patch(self.run_id,status="waiting",state={"waiting":payload})
+            interrupt(payload)
         return {}
 
     def _final_report(self, state: WorkflowState):
@@ -336,8 +451,9 @@ class WorkflowNodes:
         """
         graph=StateGraph(WorkflowState)
         nodes={"dataset_inspector":self._dataset_inspector,"data_quality":self._data_quality,"dataset_split":self._dataset_split,"auto_annotation":self._auto_annotation,"annotation_quality":self._annotation_quality,"cvat_upload":self._cvat_upload,"cvat_review":self._cvat_review,"annotation_validation":self._annotation_validation,"reviewed_export":self._reviewed_export,"training_setup":self._training_setup,"agent":self._agent,"agent_tools":self._act,"agent_sleep":self._sleep,"agent_review":self._review,"best_model":self._best_model,"final_report":self._final_report}
+        nodes["agent_context"] = self._prepare_context
         for name,node in nodes.items():
-            if name=="agent":
+            if name in {"agent", "agent_context"}:
                 graph.add_node(name,node,retry_policy=RetryPolicy(max_attempts=self.policy.max_retries+1,initial_interval=1,max_interval=5,retry_on=(APIConnectionError,APITimeoutError,InternalServerError,RateLimitError,ValueError)))
             else:
                 graph.add_node(name,node)
@@ -348,7 +464,8 @@ class WorkflowNodes:
         graph.add_conditional_edges("cvat_upload",lambda state:state.get("operation_retry",False),{True:"cvat_upload",False:"cvat_review"})
         graph.add_conditional_edges("annotation_validation",lambda state:state.get("operation_retry",False),{True:"annotation_validation",False:"reviewed_export"})
         graph.add_conditional_edges("reviewed_export",lambda state:state.get("operation_retry",False),{True:"reviewed_export",False:"training_setup"})
-        graph.add_conditional_edges("agent",lambda state:state["route"],{"act":"agent_tools","finish":"best_model"})
+        graph.add_conditional_edges("agent",lambda state:state["route"],{"act":"agent_tools","context":"agent_context","finish":"best_model"})
+        graph.add_conditional_edges("agent_context",lambda state:state["route"],{"agent":"agent","context":"agent_context","finish":"best_model"})
         graph.add_conditional_edges("agent_tools",lambda state:state["route"],{"agent":"agent","sleep":"agent_sleep","review":"agent_review","finish":"best_model"})
         compiled=graph.compile(checkpointer=checkpointer)
         # 视觉推理较慢，单步时限覆盖模型超时乘以重试次数。
